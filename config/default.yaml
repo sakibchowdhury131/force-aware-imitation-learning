@@ -1,0 +1,47 @@
+# ── Cameras ─────────────────────────────────────────────────────────────────
+cameras:
+  serials: null          # null = auto-detect all connected RealSense cameras
+  resolution: [848, 480]
+  fps: 30
+  warmup_frames: 20
+
+# ── Recording ────────────────────────────────────────────────────────────────
+record:
+  output_dir: data/episodes
+  duration_sec: 15.0
+
+# ── Novel view augmentation ──────────────────────────────────────────────────
+augment:
+  num_novel_views: 6     # per-frame novel views to render
+  gs_iters_with_pruning: 500
+  gs_iters_without_pruning: 100
+  conf_threshold: 1.5
+  sample_every_n_frames: 15   # augment 1 in N frames (2fps at 30fps capture)
+
+# ── Segmentation (GroundedSAM) ───────────────────────────────────────────────
+segment:
+  # Text prompt for what to mask out (human body parts)
+  mask_prompt: "human hand . human arm . person"
+  box_threshold: 0.3
+  text_threshold: 0.25
+  grounding_dino_config: "../Tool_as_Interface/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+  grounding_dino_weights: "../Tool_as_Interface/checkpoints/groundingdino_swint_ogc.pth"
+  sam_weights: "../Tool_as_Interface/checkpoints/sam_vit_h_4b8939.pth"
+
+# ── Tool tracking (FoundationPose) ───────────────────────────────────────────
+track:
+  tool_prompt: "hammer"  # text prompt to detect the tool with GroundedSAM
+  foundation_pose_dir: "../Tool_as_Interface/FoundationPose"
+  mesh_file: null        # path to tool mesh (.obj) — required for FoundationPose
+
+# ── Diffusion policy training ────────────────────────────────────────────────
+train:
+  output_dir: data/checkpoints
+  obs_horizon: 2         # frames of observation history
+  action_horizon: 8      # frames to predict
+  prediction_horizon: 16
+  num_epochs: 300
+  batch_size: 64
+  lr: 1.0e-4
+  image_size: [96, 96]   # resize for policy input
+  device: cuda

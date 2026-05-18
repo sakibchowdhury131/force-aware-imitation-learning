@@ -1,0 +1,27 @@
+# Model weights and checkpoints (download separately — see README)
+checkpoints/**
+!checkpoints/.gitkeep
+
+# Recorded episodes and training data
+data/**
+!data/.gitkeep
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# FoundationPose debug output
+/tmp/fp_*/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
