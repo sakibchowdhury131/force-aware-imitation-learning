@@ -183,15 +183,27 @@ For each sampled timestep: runs MASt3R stereo reconstruction on the camera pair,
 trains 3D Gaussians, and renders novel views from Slerp-interpolated camera poses.
 Also saves the per-frame camera matrices needed by step 4 temporal tracking.
 
+Can process a single episode or all episodes in a task directory in one go.
+The MASt3R model is loaded once and reused across all episodes.
+
 ```bash
+# Single episode
 python 02_augment.py --episode_dir data/episodes/hammer/001
+
+# All episodes in a task (recommended)
+python 02_augment.py --task_dir data/episodes/hammer
+
+# Skip episodes already processed
+python 02_augment.py --task_dir data/episodes/hammer --skip_done
 ```
 
 **Arguments:**
 
 | Argument | Default | Description |
 |---|---|---|
-| `--episode_dir` | required | Path to the episode directory |
+| `--episode_dir` | — | Single episode to process (mutually exclusive with `--task_dir`) |
+| `--task_dir` | — | Task directory; processes all episode subdirs with a `meta.json` |
+| `--skip_done` | off | Skip episodes that already have `novel_cameras.npz` |
 | `--num_novel_views` | `6` | Novel views to render per timestep (must be even) |
 | `--sample_every` | `15` | Process every Nth frame (15 = 2 fps from 30 fps) |
 | `--gs_iters_pruning` | `500` | Gaussian splatting pruning iterations |
@@ -216,17 +228,27 @@ augmented/
 ### Step 3 — Mask human hands/arms (`03_segment.py`)
 
 Uses GroundedSAM (GroundingDINO + SAM ViT-H) to detect and black out human body
-parts in both real and novel view frames.
+parts in both real and novel view frames. Models are loaded once and reused across
+all episodes.
 
 ```bash
+# Single episode
 python 03_segment.py --episode_dir data/episodes/hammer/001
+
+# All episodes in a task
+python 03_segment.py --task_dir data/episodes/hammer
+
+# Skip episodes already processed
+python 03_segment.py --task_dir data/episodes/hammer --skip_done
 ```
 
 **Arguments:**
 
 | Argument | Default | Description |
 |---|---|---|
-| `--episode_dir` | required | |
+| `--episode_dir` | — | Single episode (mutually exclusive with `--task_dir`) |
+| `--task_dir` | — | Task directory; processes all episodes |
+| `--skip_done` | off | Skip episodes that already have `masked_real/` and `masked_novel/` |
 | `--prompt` | `"human hand . human arm . person"` | GroundingDINO text prompt |
 | `--box_threshold` | `0.3` | Detection confidence threshold |
 | `--text_threshold` | `0.25` | Text matching threshold |
@@ -244,21 +266,33 @@ augmented/
 ### Step 4 — Track tool pose (`04_track.py`)
 
 Estimates 6DOF tool pose using FoundationPose. Runs in one of two modes depending
-on what data is available.
+on what data is available. Models (GroundingDINO, SAM, FoundationPose) are loaded
+once and reused across all episodes.
 
 ```bash
+# Single episode
 python 04_track.py --episode_dir data/episodes/hammer/001 \
     --tool_prompt "hammer" --mesh Hammer.obj
+
+# All episodes in a task
+python 04_track.py --task_dir data/episodes/hammer \
+    --tool_prompt "hammer" --mesh Hammer.obj
+
+# Skip already-processed episodes
+python 04_track.py --task_dir data/episodes/hammer \
+    --tool_prompt "hammer" --mesh Hammer.obj --skip_done
 ```
 
 **Arguments:**
 
 | Argument | Default | Description |
 |---|---|---|
-| `--episode_dir` | required | |
+| `--episode_dir` | — | Single episode (mutually exclusive with `--task_dir`) |
+| `--task_dir` | — | Task directory; processes all episodes |
 | `--mesh` | required | Path to tool mesh (.obj or .ply) |
 | `--tool_prompt` | `"hammer"` | Text prompt for initial segmentation |
 | `--camera` | `0` | Which real camera to use for RGBD tracking |
+| `--skip_done` | off | Skip episodes that already have `tool_poses.npz` |
 | `--box_threshold` | `0.3` | |
 | `--text_threshold` | `0.25` | |
 | `--est_refine_iter` | `5` | Iterations for initial registration |
@@ -266,13 +300,12 @@ python 04_track.py --episode_dir data/episodes/hammer/001 \
 | `--depth_const` | `0.5` | Fallback depth (m) when no DA2 maps exist |
 | `--device` | `cuda` | |
 
-**Tracking modes** (auto-detected):
+**Tracking modes** (auto-detected per episode):
 
 - **TEMPORAL** (preferred): used when `camN_depth/` and `novel_cameras.npz` both exist.
   Segments the tool on frame 0, registers an initial pose, then calls `track_one()` on
   every subsequent frame. Each tracked cam pose is transformed into all novel-view frames
   via: `pose_novel = novel_w2c[k] @ inv(camN_w2c) @ pose_camN`.
-  Requires re-running `02_augment.py` if `novel_cameras.npz` is missing.
 
 - **FALLBACK**: used when depth or camera matrices are unavailable. Independently segments
   and registers every masked novel view using DA2 depth maps (if present) or a constant
@@ -284,14 +317,7 @@ python 04_track.py --episode_dir data/episodes/hammer/001 \
 ```
 augmented/
     tool_poses.npz         ← str(frame_id) → (N_novel, 4, 4) poses in each novel view
-    tool_poses_cam0.npz    ← str(frame_id) → (4, 4) raw pose in cam0 frame (temporal only)
-    tool_poses_cam1.npz    ← same for cam1, if --camera 1 was used
-```
-
-To use cam1 for tracking:
-```bash
-python 04_track.py --episode_dir data/episodes/hammer/001 \
-    --tool_prompt "hammer" --mesh Hammer.obj --camera 1
+    tool_poses_cam0.npz    ← str(frame_id) → (4, 4) raw pose in camN frame (temporal only)
 ```
 
 ---
@@ -301,25 +327,110 @@ python 04_track.py --episode_dir data/episodes/hammer/001 \
 Trains a DDPM-based policy on (novel view image → 6DOF tool pose) pairs.
 Observation: 96×96 RGB image. Action: 9D = 6D rotation (first two columns of R) + 3D translation.
 
+Already operates at task level — pass the task directory and it automatically
+loads all episodes under it.
+
 ```bash
 python 05_train.py --data_dir data/episodes/hammer \
     --output_dir data/checkpoints/hammer
+```
+
+**Image pipeline** (matches the original paper):
+- Resize to **128×128**
+- Random crop to **115×115** during training; center crop during eval
+- ColorJitter augmentation (brightness, contrast, saturation ±0.2)
+
+**Arguments:**
+
+| Argument | Default | Description |
+|---|---|---|
+| `--data_dir` | required | Task directory containing all episode subdirectories |
+| `--output_dir` | `data/checkpoints` | Where to save checkpoints |
+| `--num_epochs` | `3050` | Matches original paper |
+| `--batch_size` | `32` | Matches original paper |
+| `--lr` | `1e-4` | Learning rate |
+| `--image_size` | `128` | Resize images to this size before cropping (original paper: 128) |
+| `--crop_size` | `115` | Random crop size during training (original paper: 115) |
+| `--action_horizon` | `8` | Action sequence length |
+| `--checkpoint_every` | `100` | Save a checkpoint every N epochs |
+| `--device` | `cuda` | |
+
+Checkpoints saved every `--checkpoint_every` epochs and at the end as `policy_final.pt`.
+Each checkpoint stores `image_size` and `crop_size` so inference can apply the correct transform.
+
+---
+
+### Test / inference (`test_policy.py`)
+
+Runs a trained checkpoint on a temporal window of images or a full episode. No robot required.
+
+**Inputs:** `n_obs_steps` consecutive masked novel views (stacked along channels, matching training)
+**Output:** `action_horizon` future tool poses as 9D vectors `[tx, ty, tz, rot6d]`, decoded to 4×4 matrices
+
+```bash
+# Single window — provide n_obs_steps images oldest→newest (here n_obs_steps=2)
+python test_policy.py \
+    --checkpoint data/checkpoints/hammer/policy_final.pt \
+    --images frame_t-1.jpg frame_t.jpg
+
+# One image is OK too — repeated for all obs steps (quick sanity check)
+python test_policy.py \
+    --checkpoint data/checkpoints/hammer/policy_final.pt \
+    --images data/episodes/hammer/001/augmented/masked_novel/000030_novel0.jpg
+
+# Full episode — XYZ axes overlay on real cam0 images (no mesh needed)
+python test_policy.py \
+    --checkpoint data/checkpoints/hammer/policy_final.pt \
+    --episode_dir data/episodes/hammer/001 \
+    --overlay --output_dir /tmp/policy_test
+
+# Full episode — trajectory plot (tx/ty/tz vs time, shown against GT if available)
+python test_policy.py \
+    --checkpoint data/checkpoints/hammer/policy_final.pt \
+    --episode_dir data/episodes/hammer/001 \
+    --plot_trajectory --output_dir /tmp/policy_test
+
+# Full episode — 3D bounding-box overlay (requires trimesh + FoundationPose)
+python test_policy.py \
+    --checkpoint data/checkpoints/hammer/policy_final.pt \
+    --episode_dir data/episodes/hammer/001 \
+    --mesh hammer.obj --output_dir /tmp/policy_test
 ```
 
 **Arguments:**
 
 | Argument | Default | Description |
 |---|---|---|
-| `--data_dir` | required | Directory containing episode subdirectories |
-| `--output_dir` | `data/checkpoints` | Where to save checkpoints |
-| `--num_epochs` | `300` | |
-| `--batch_size` | `64` | |
-| `--lr` | `1e-4` | Learning rate |
-| `--image_size` | `96` | Input image resolution |
-| `--action_horizon` | `8` | Action sequence length |
+| `--checkpoint` | required | Path to `.pt` checkpoint from step 5 |
+| `--images` | — | One or more image paths, oldest → newest (mutually exclusive with `--episode_dir`) |
+| `--episode_dir` | — | Episode dir; sliding window over `augmented/masked_novel/` |
+| `--overlay` | off | Draw RGB XYZ axes on real cam0 images — no mesh needed |
+| `--plot_trajectory` | off | Save `trajectory.png` (tx/ty/tz vs frame); overlays GT if `tool_poses_cam0.npz` exists |
+| `--mesh` | `None` | Tool mesh for 3D bounding-box overlay (optional; falls back to axes if unavailable) |
+| `--output_dir` | `augmented/policy_predictions/` | Where to save output images / npz files |
 | `--device` | `cuda` | |
 
-Checkpoints saved every 50 epochs and at the end as `policy_final.pt`.
+> **Why overlay on cam0 images?**
+> Predicted poses are in the **cam0 camera frame**, so drawing axes on the real cam0 image
+> (from `augmented/masked_real/`) is geometrically exact. Novel-view images use a different
+> virtual camera, so overlaying on them requires an extra frame transform.
+
+**Inference pipeline:**
+1. Stack `n_obs_steps` frames along channel dim → `(1, n_obs_steps×3, H, W)` (matches training)
+2. Encode with shared ResNet-18 per frame → project to 512-dim obs embedding
+3. Start from Gaussian noise in action space `(1, action_horizon × 9)`
+4. Run 100 DDPM denoising steps conditioned on obs embedding (FiLM scale+shift per layer)
+5. Denormalize with `MaxAbsNormalizer` loaded from the checkpoint
+6. Reshape to `(action_horizon, 9)` — each step is `[tx, ty, tz, rot6d(6)]`
+
+**Output files (episode mode):**
+- `{fid}_pred.jpg` — cam0 image with predicted pose axes / bbox overlaid
+- `predicted_poses.npz` — first predicted step per window: `{fid: (4,4)}` in cam0 frame (metres)
+- `predicted_action_seqs.npz` — full `(action_horizon, 9)` sequence per window
+- `trajectory.png` — translation plot (with `--plot_trajectory`)
+
+All model hyper-parameters (`image_size`, `crop_size`, `n_obs_steps`, normalizer) are read
+directly from the checkpoint — no need to pass them manually.
 
 ---
 

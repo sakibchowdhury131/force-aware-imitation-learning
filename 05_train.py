@@ -1,20 +1,32 @@
 """
 Step 5 — Train a diffusion policy on the augmented data.
 
-Observation: RGB image (masked novel view, resized to 96×96)
-Action:      6DOF tool pose as 6D rotation representation + translation (9D total)
+Faithful re-implementation of the original Tool-as-Interface training approach:
 
-Architecture: DDPM with UNet backbone (Chi et al. 2023)
+  Observation:
+    n_obs_steps (default 2) consecutive frames, each represented by one
+    masked novel view image randomly sampled from available views per frame.
+    Images are stacked along the channel dimension.
+
+  Action:
+    Sequence of the NEXT action_horizon (default 8) tool poses in the cam0
+    frame — i.e. the policy sees the current state and predicts where the tool
+    should be over the next horizon steps. Each pose is 9D: [tx, ty, tz, r6d(6)].
+    This matches the original paper's use of robot EEF poses shifted by +1.
+
+  Normalisation:
+    Max-abs scaling → [-1, 1] on each action dimension independently.
+    Computed once from all training data, same as the original paper.
+
+  Episodes without tool_poses_cam0.npz (fallback mode) are skipped — temporal
+  consistency requires the real-depth cam0 tracking from step 4.
 
 Usage:
-    python 05_train.py --data_dir data/episodes/hammer \
+    python 05_train.py --data_dir data/episodes/hammer \\
         --output_dir data/checkpoints/hammer
-
-Requires:
-    pip install diffusers accelerate
 """
 
-import os, sys, glob, argparse, json
+import os, glob, argparse
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,108 +34,260 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
-import cv2
-from diffusers import DDPMScheduler, UNet2DConditionModel
+from diffusers import DDPMScheduler
 from diffusers.optimization import get_cosine_schedule_with_warmup
 
 
-# ── Rotation utilities ────────────────────────────────────────────────────────
+# ── Rotation / pose utilities ─────────────────────────────────────────────────
 
 def matrix_to_6d(R: np.ndarray) -> np.ndarray:
-    """Convert (3,3) rotation matrix to 6D representation (first two columns)."""
-    return R[:, :2].T.reshape(6)  # (6,)
+    """(3,3) rotation matrix → 6D (first two columns, row-major)."""
+    return R[:, :2].T.reshape(6)
 
 
-def pose_to_action(T: np.ndarray) -> np.ndarray:
-    """Convert (4,4) pose matrix → 9D action [6d_rotation, translation]."""
-    R = T[:3, :3]
-    t = T[:3, 3]
-    return np.concatenate([matrix_to_6d(R), t])  # (9,)
+def pose_matrix_to_9d(T: np.ndarray) -> np.ndarray:
+    """(4,4) pose → 9D [tx, ty, tz, rot6d] — translation first, matches original."""
+    return np.concatenate([T[:3, 3], matrix_to_6d(T[:3, :3])]).astype(np.float32)
+
+
+def rot6d_to_matrix(r6d: np.ndarray) -> np.ndarray:
+    """6D → (3,3) via Gram-Schmidt. Inverse of matrix_to_6d."""
+    a1, a2 = r6d[:3], r6d[3:]
+    b1 = a1 / (np.linalg.norm(a1) + 1e-8)
+    b2 = a2 - np.dot(b1, a2) * b1
+    b2 = b2 / (np.linalg.norm(b2) + 1e-8)
+    b3 = np.cross(b1, b2)
+    return np.stack([b1, b2, b3], axis=1)
+
+
+def action_9d_to_pose(a: np.ndarray) -> np.ndarray:
+    """9D action [tx, ty, tz, rot6d] → (4,4) pose."""
+    T = np.eye(4, dtype=np.float64)
+    T[:3, 3]  = a[:3]
+    T[:3, :3] = rot6d_to_matrix(a[3:])
+    return T
+
+
+# ── Normaliser ────────────────────────────────────────────────────────────────
+
+class MaxAbsNormalizer:
+    """
+    Scales each action dimension independently so that the max absolute value
+    maps to 1. Matches the original paper's normalizer_from_stat() logic.
+    """
+    def __init__(self, actions: np.ndarray):
+        # actions: (N, action_dim)
+        max_abs = np.maximum(actions.max(axis=0), np.abs(actions.min(axis=0)))
+        max_abs = np.where(max_abs < 1e-8, 1.0, max_abs)
+        self.scale  = (1.0 / max_abs).astype(np.float32)   # (action_dim,)
+        self.offset = np.zeros_like(self.scale)
+
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        return x * self.scale + self.offset
+
+    def denormalize(self, x: np.ndarray) -> np.ndarray:
+        return (x - self.offset) / self.scale
+
+    def state_dict(self):
+        return {'scale': self.scale, 'offset': self.offset}
+
+    @classmethod
+    def from_state_dict(cls, d):
+        obj = cls.__new__(cls)
+        obj.scale  = d['scale']
+        obj.offset = d['offset']
+        return obj
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
-class AugmentedEpisodeDataset(Dataset):
-    def __init__(self, data_dir: str, obs_horizon: int = 2,
-                 action_horizon: int = 8, image_size: int = 96):
-        """
-        Loads from all episodes under data_dir/.
-        Each episode: augmented/masked_novel/*.jpg  +  augmented/tool_poses.npz
-        """
-        self.obs_horizon    = obs_horizon
+class EpisodeWindowDataset(Dataset):
+    """
+    Temporal window sampler over episodes.
+
+    For each episode:
+      - frame_ids: sorted list of sampled frame indices (e.g. 0, 15, 30, ...)
+      - cam0_poses: frame_id → (4,4) tool pose in cam0 frame
+
+    Each sample:
+      obs_paths  — list[n_obs_steps] of lists[n_novel_views] of image paths
+      action_seq — (action_horizon, 9) normalised cam0 poses
+    """
+
+    def __init__(self, data_dir: str, n_obs_steps: int = 2,
+                 action_horizon: int = 8, image_size: int = 128,
+                 crop_size: int = 115, training: bool = True):
+        self.n_obs_steps    = n_obs_steps
         self.action_horizon = action_horizon
-        self.transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ])
+        self.training       = training
 
-        # Build flat list of (img_path, action_9d) across all episodes
-        self.samples = []
+        if training:
+            self.transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.RandomCrop(crop_size),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.CenterCrop(crop_size),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            ])
+
+        # ── collect raw samples and all actions for normaliser ────────────────
+        raw_samples  = []   # (episode_dir, obs_frame_ids, act_frame_ids)
+        all_actions  = []   # flat list of 9D actions for normaliser fitting
+
         for ep_dir in sorted(glob.glob(os.path.join(data_dir, '*'))):
-            pose_file = os.path.join(ep_dir, 'augmented', 'tool_poses.npz')
+            # Prefer task-frame poses (calibrated via 00_calibrate.py) over cam0 poses
+            task_path = os.path.join(ep_dir, 'augmented', 'tool_poses_task.npz')
+            cam0_path = os.path.join(ep_dir, 'augmented', 'tool_poses_cam0.npz')
+            pose_path = task_path if os.path.exists(task_path) else cam0_path
             novel_dir = os.path.join(ep_dir, 'augmented', 'masked_novel')
-            if not os.path.exists(pose_file) or not os.path.exists(novel_dir):
+            if not os.path.exists(pose_path) or not os.path.isdir(novel_dir):
                 continue
-            poses = np.load(pose_file)
-            for frame_id_str in sorted(poses.keys(), key=int):
-                frame_id   = int(frame_id_str)
-                frame_poses = poses[frame_id_str]  # (N_novel, 4, 4)
-                for k, T in enumerate(frame_poses):
-                    img_path = os.path.join(novel_dir,
-                                            f'{frame_id:06d}_novel{k:02d}.jpg')
-                    if os.path.exists(img_path):
-                        action = pose_to_action(T).astype(np.float32)
-                        self.samples.append((img_path, action))
 
-        if not self.samples:
-            raise RuntimeError(f"No samples found under {data_dir}. "
-                               "Run steps 2–4 first.")
+            poses_raw = dict(np.load(pose_path))            # str(fid) → (4,4)
+            frame_ids = sorted(poses_raw.keys(), key=int)
+            n_frames  = len(frame_ids)
 
-        print(f"Dataset: {len(self.samples)} (image, action) pairs")
+            if n_frames < n_obs_steps + action_horizon:
+                continue
+
+            # Convert all poses to 9D for normaliser stats
+            for fid in frame_ids:
+                all_actions.append(pose_matrix_to_9d(poses_raw[fid]))
+
+            # Sliding window: obs = frames[i-n_obs+1 … i], action = frames[i+1 … i+H]
+            for i in range(n_obs_steps - 1, n_frames - action_horizon):
+                obs_fids = frame_ids[i - n_obs_steps + 1 : i + 1]
+                act_fids = frame_ids[i + 1 : i + 1 + action_horizon]
+
+                # Verify all novel view images exist for obs frames
+                obs_paths = []
+                valid = True
+                for fid in obs_fids:
+                    paths = sorted(glob.glob(
+                        os.path.join(novel_dir, f'{int(fid):06d}_novel*.jpg')))
+                    if not paths:
+                        valid = False
+                        break
+                    obs_paths.append(paths)
+
+                if not valid:
+                    continue
+
+                # Build action sequence — absolute poses in task/cam0 frame
+                act_seq = np.stack([pose_matrix_to_9d(poses_raw[fid])
+                                    for fid in act_fids])   # (H, 9)
+                raw_samples.append((obs_paths, act_seq))
+
+        if not raw_samples:
+            raise RuntimeError(
+                f"No temporal samples found under {data_dir}.\n"
+                "  Ensure step 4 ran in TEMPORAL mode (produces tool_poses_cam0.npz).\n"
+                "  Episodes processed in FALLBACK mode are skipped.")
+
+        # ── fit normaliser from all action data ───────────────────────────────
+        all_actions = np.stack(all_actions)   # (N_total, 9)
+        self.normalizer = MaxAbsNormalizer(all_actions)
+
+        # ── store normalised samples ──────────────────────────────────────────
+        self.samples = []
+        for obs_paths, act_seq in raw_samples:
+            self.samples.append((obs_paths, self.normalizer.normalize(act_seq)))
+
+        print(f"Dataset: {len(self.samples)} windows  |  "
+              f"obs_steps={n_obs_steps}  action_horizon={action_horizon}  "
+              f"action_dim=9")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path, action = self.samples[idx]
-        img = Image.open(img_path).convert('RGB')
-        img = self.transform(img)   # (3, H, W)
-        return img, torch.from_numpy(action)
+        obs_paths, act_seq = self.samples[idx]   # act_seq already normalised
+
+        imgs = []
+        for frame_paths in obs_paths:
+            # Training: random novel view. Eval: first view.
+            path = (frame_paths[np.random.randint(len(frame_paths))]
+                    if self.training else frame_paths[0])
+            imgs.append(self.transform(Image.open(path).convert('RGB')))
+
+        # Stack along channel dim: (n_obs_steps*3, H, W)
+        obs_img = torch.cat(imgs, dim=0)
+        return obs_img, torch.from_numpy(act_seq)   # (C, H, W), (H, 9)
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 class DiffusionPolicyNet(nn.Module):
     """
-    Minimal DDPM-based policy:
-      - Vision encoder: ResNet-18 (frozen backbone, fine-tuned head)
-      - Noise prediction: lightweight MLP diffusion model over action sequence
+    DDPM-based policy.
+
+    Observation encoder:
+      - Each of n_obs_steps frames encoded independently by ResNet-18
+      - Temporal embeddings averaged → obs_dim (512)
+
+    Noise predictor:
+      - Conditioned on obs embedding via FiLM (scale + shift per layer)
+      - Predicts noise over the flattened action sequence (action_horizon × 9)
     """
 
     def __init__(self, action_dim: int = 9, obs_dim: int = 512,
-                 action_horizon: int = 8, num_train_timesteps: int = 100):
+                 action_horizon: int = 8, n_obs_steps: int = 2):
         super().__init__()
         import torchvision.models as tvm
+
+        self.n_obs_steps    = n_obs_steps
+        self.action_horizon = action_horizon
+        self.action_dim     = action_dim
+        flat_action         = action_dim * action_horizon
+
+        # Shared ResNet-18 backbone for all obs frames
         backbone = tvm.resnet18(weights=tvm.ResNet18_Weights.DEFAULT)
         self.encoder = nn.Sequential(*list(backbone.children())[:-1])  # → (B, 512, 1, 1)
 
-        self.action_horizon = action_horizon
-        self.action_dim     = action_dim
-        flat_action = action_dim * action_horizon
-
-        self.noise_pred = nn.Sequential(
-            nn.Linear(obs_dim + flat_action + 1, 512),  # +1 for timestep embedding
+        # Project concatenated obs embeddings
+        self.obs_proj = nn.Sequential(
+            nn.Linear(obs_dim * n_obs_steps, obs_dim),
             nn.SiLU(),
-            nn.Linear(512, 512),
-            nn.SiLU(),
-            nn.Linear(512, flat_action),
         )
 
+        # Timestep embedding (sinusoidal-inspired, simple learned)
+        self.time_emb = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.SiLU(),
+            nn.Linear(64, 64),
+        )
+
+        # Noise predictor with FiLM conditioning on obs
+        hidden = 512
+        self.net = nn.ModuleList([
+            nn.Linear(flat_action + 64, hidden),
+            nn.Linear(hidden, hidden),
+            nn.Linear(hidden, hidden),
+            nn.Linear(hidden, flat_action),
+        ])
+        # FiLM scale + shift from obs per hidden layer (first 3 layers)
+        self.film = nn.ModuleList([
+            nn.Linear(obs_dim, hidden * 2) for _ in range(3)
+        ])
+        self.act = nn.SiLU()
+
     def encode_obs(self, imgs: torch.Tensor) -> torch.Tensor:
-        """imgs: (B, 3, H, W) → (B, 512)"""
-        feats = self.encoder(imgs).squeeze(-1).squeeze(-1)
-        return feats
+        """
+        imgs: (B, n_obs_steps*3, H, W) — obs frames stacked along channels
+        Returns: (B, obs_dim)
+        """
+        B = imgs.shape[0]
+        # Split back into individual frames and encode each
+        frame_imgs = imgs.chunk(self.n_obs_steps, dim=1)   # n_obs_steps × (B, 3, H, W)
+        embs = [self.encoder(f).squeeze(-1).squeeze(-1) for f in frame_imgs]
+        return self.obs_proj(torch.cat(embs, dim=-1))      # (B, obs_dim)
 
     def forward(self, noisy_actions: torch.Tensor, timesteps: torch.Tensor,
                 obs_emb: torch.Tensor) -> torch.Tensor:
@@ -133,9 +297,18 @@ class DiffusionPolicyNet(nn.Module):
         obs_emb:       (B, obs_dim)
         Returns predicted noise: (B, action_horizon * action_dim)
         """
-        t_emb = timesteps.float().unsqueeze(-1) / 100.0
-        x = torch.cat([obs_emb, noisy_actions, t_emb], dim=-1)
-        return self.noise_pred(x)
+        t_emb = self.time_emb(timesteps.float().unsqueeze(-1) / 100.0)  # (B, 64)
+        x = torch.cat([noisy_actions, t_emb], dim=-1)
+
+        for i, layer in enumerate(self.net[:-1]):
+            x = layer(x)
+            # FiLM: scale + shift from obs embedding
+            film_out = self.film[i](obs_emb)
+            scale, shift = film_out.chunk(2, dim=-1)
+            x = x * (1 + scale) + shift
+            x = self.act(x)
+
+        return self.net[-1](x)
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
@@ -144,51 +317,60 @@ def train(args):
     device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    dataset    = AugmentedEpisodeDataset(args.data_dir,
-                                         image_size=args.image_size)
+    dataset = EpisodeWindowDataset(
+        data_dir=args.data_dir,
+        n_obs_steps=args.n_obs_steps,
+        action_horizon=args.action_horizon,
+        image_size=args.image_size,
+        crop_size=args.crop_size,
+        training=True,
+    )
     dataloader = DataLoader(dataset, batch_size=args.batch_size,
                             shuffle=True, num_workers=4, pin_memory=True)
 
     model = DiffusionPolicyNet(
         action_dim=9,
         action_horizon=args.action_horizon,
+        n_obs_steps=args.n_obs_steps,
     ).to(device)
 
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=100,
+        beta_start=0.0001,
+        beta_end=0.02,
         beta_schedule='squaredcos_cap_v2',
         clip_sample=True,
         prediction_type='epsilon',
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                  betas=(0.95, 0.999), eps=1e-8, weight_decay=1e-6)
     lr_sched  = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=500,
         num_training_steps=args.num_epochs * len(dataloader),
     )
 
-    print(f"Training for {args.num_epochs} epochs, {len(dataloader)} steps/epoch")
+    print(f"Image: {args.image_size}×{args.image_size} → crop {args.crop_size}×{args.crop_size}")
+    print(f"Obs steps: {args.n_obs_steps}  |  Action horizon: {args.action_horizon}")
+    print(f"Training: {args.num_epochs} epochs  |  batch {args.batch_size}  "
+          f"|  {len(dataloader)} steps/epoch")
 
     for epoch in range(args.num_epochs):
         model.train()
         epoch_loss = 0.0
-        for imgs, actions in dataloader:
-            imgs    = imgs.to(device)        # (B, 3, H, W)
-            actions = actions.to(device)     # (B, 9)
 
-            # Repeat action across horizon (simplified: same action for all steps)
-            actions_seq = actions.unsqueeze(1).repeat(1, args.action_horizon, 1)
-            actions_flat = actions_seq.reshape(len(imgs), -1)  # (B, action_horizon*9)
+        for obs_imgs, actions in dataloader:
+            obs_imgs = obs_imgs.to(device)    # (B, n_obs*3, H, W)
+            actions  = actions.to(device)     # (B, action_horizon, 9)  — already normalised
 
-            # Forward diffusion
+            actions_flat = actions.reshape(len(obs_imgs), -1)   # (B, horizon*9)
+
             noise     = torch.randn_like(actions_flat)
-            timesteps = torch.randint(0, 100, (len(imgs),), device=device).long()
+            timesteps = torch.randint(0, 100, (len(obs_imgs),), device=device).long()
             noisy     = noise_scheduler.add_noise(actions_flat, noise, timesteps)
 
-            # Predict noise
-            with torch.no_grad():
-                obs_emb = model.encode_obs(imgs)
+            obs_emb    = model.encode_obs(obs_imgs)
             pred_noise = model(noisy, timesteps, obs_emb)
 
             loss = F.mse_loss(pred_noise, noise)
@@ -201,33 +383,55 @@ def train(args):
 
         avg = epoch_loss / len(dataloader)
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch [{epoch+1}/{args.num_epochs}]  loss={avg:.4f}")
+            print(f"Epoch [{epoch+1:4d}/{args.num_epochs}]  loss={avg:.4f}")
 
-        if (epoch + 1) % 50 == 0:
-            ckpt = os.path.join(args.output_dir, f'policy_epoch{epoch+1}.pt')
-            torch.save({'epoch': epoch+1, 'model': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'noise_scheduler': noise_scheduler,
-                        'action_horizon': args.action_horizon}, ckpt)
-            print(f"  Saved checkpoint: {ckpt}")
+        if (epoch + 1) % args.checkpoint_every == 0:
+            _save(args, epoch + 1, model, optimizer, noise_scheduler, dataset)
 
-    final_ckpt = os.path.join(args.output_dir, 'policy_final.pt')
-    torch.save({'epoch': args.num_epochs, 'model': model.state_dict(),
-                'noise_scheduler': noise_scheduler,
-                'action_horizon': args.action_horizon}, final_ckpt)
-    print(f"\nTraining complete. Final checkpoint: {final_ckpt}")
+    _save(args, args.num_epochs, model, None, noise_scheduler, dataset,
+          name='policy_final.pt')
+    print(f"\nTraining complete → {args.output_dir}/policy_final.pt")
+
+
+def _save(args, epoch, model, optimizer, noise_scheduler, dataset, name=None):
+    name = name or f'policy_epoch{epoch:04d}.pt'
+    ckpt = {
+        'epoch':            epoch,
+        'model':            model.state_dict(),
+        'noise_scheduler':  noise_scheduler,
+        'action_horizon':   args.action_horizon,
+        'n_obs_steps':      args.n_obs_steps,
+        'image_size':       args.image_size,
+        'crop_size':        args.crop_size,
+        'normalizer':       dataset.normalizer.state_dict(),
+    }
+    if optimizer is not None:
+        ckpt['optimizer'] = optimizer.state_dict()
+    path = os.path.join(args.output_dir, name)
+    torch.save(ckpt, path)
+    print(f"  Saved checkpoint: {path}")
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--data_dir',      required=True, help='Dir containing episode subdirs')
-    p.add_argument('--output_dir',    default='data/checkpoints')
-    p.add_argument('--num_epochs',    type=int,   default=300)
-    p.add_argument('--batch_size',    type=int,   default=64)
-    p.add_argument('--lr',            type=float, default=1e-4)
-    p.add_argument('--image_size',    type=int,   default=96)
-    p.add_argument('--action_horizon',type=int,   default=8)
-    p.add_argument('--device',        default='cuda')
+    p.add_argument('--data_dir',         required=True,
+                   help='Task directory containing episode subdirectories')
+    p.add_argument('--output_dir',       default='data/checkpoints')
+    p.add_argument('--num_epochs',       type=int,   default=3050,
+                   help='Matches original paper')
+    p.add_argument('--batch_size',       type=int,   default=32,
+                   help='Matches original paper')
+    p.add_argument('--lr',               type=float, default=1e-4)
+    p.add_argument('--image_size',       type=int,   default=128,
+                   help='Resize images to this size before cropping (original: 128)')
+    p.add_argument('--crop_size',        type=int,   default=115,
+                   help='Random crop size during training (original: 115)')
+    p.add_argument('--n_obs_steps',      type=int,   default=2,
+                   help='Number of consecutive frames as observation (original: 2)')
+    p.add_argument('--action_horizon',   type=int,   default=8,
+                   help='Number of future poses to predict (original: 8)')
+    p.add_argument('--checkpoint_every', type=int,   default=100)
+    p.add_argument('--device',           default='cuda')
     return p.parse_args()
 
 

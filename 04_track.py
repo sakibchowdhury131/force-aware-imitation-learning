@@ -4,13 +4,13 @@ Step 4 — Estimate tool pose using FoundationPose.
 Two modes depending on available data:
 
   TEMPORAL (preferred, requires real depth from step 1):
-    Segments tool on the first cam0 frame, registers with FoundationPose, then
-    tracks 6DOF pose through the sampled cam0 sequence.  For each timestep the
-    tracked cam0 pose is transformed into every novel-view frame using the
-    camera matrices saved by step 2.
+    Segments tool on the first camN frame, registers with FoundationPose, then
+    tracks 6DOF pose through the sampled camN sequence.  For each timestep the
+    tracked pose is transformed into every novel-view frame using the camera
+    matrices saved by step 2.
 
     Requires:
-      data/episodes/<task>/<ep>/cam0_depth/     (recorded by 01_record.py)
+      data/episodes/<task>/<ep>/camN_depth/     (recorded by 01_record.py)
       data/episodes/<task>/<ep>/augmented/novel_cameras.npz  (saved by 02_augment.py)
 
   FALLBACK (per-view registration, no real depth needed):
@@ -20,11 +20,15 @@ Two modes depending on available data:
     Pre-compute depth with:
       python generate_depth.py --image_dir .../augmented/masked_novel
 
-Usage:
+Usage (single episode):
     python 04_track.py --episode_dir data/episodes/hammer/001 \\
         --tool_prompt "hammer" --mesh Hammer.obj
 
-Output:
+Usage (all episodes in a task):
+    python 04_track.py --task_dir data/episodes/hammer \\
+        --tool_prompt "hammer" --mesh Hammer.obj
+
+Output (per episode):
     data/episodes/<task>/<episode>/augmented/tool_poses.npz
         dict: str(frame_id) → (N_novel, 4, 4) pose matrices
 """
@@ -53,7 +57,9 @@ GDINO_CONFIG = os.path.join(os.path.dirname(groundingdino.__file__),
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--episode_dir', required=True)
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument('--episode_dir', help='Single episode to process')
+    src.add_argument('--task_dir',    help='Task directory; processes all episodes')
     p.add_argument('--tool_prompt', default='hammer')
     p.add_argument('--mesh',        required=True, help='Path to tool mesh (.obj or .ply)')
     p.add_argument('--camera',      type=int, default=0,
@@ -64,6 +70,12 @@ def parse_args():
     p.add_argument('--track_refine_iter',type=int,   default=2)
     p.add_argument('--depth_const',      type=float, default=0.5,
                    help='Fallback depth (m) when DA2 maps are absent')
+    p.add_argument('--skip_done', action='store_true',
+                   help='Skip episodes that already have tool_poses.npz')
+    p.add_argument('--task_frame', default=None,
+                   help='Path to cam_extrinsics.npy (from 00_calibrate.py). '
+                        'When provided, tool poses are transformed to task/world frame '
+                        'and saved as tool_poses_task.npz in addition to cam0 poses.')
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     return p.parse_args()
 
@@ -273,26 +285,82 @@ def fallback_track(args, meta, aug_dir, est, gdino, sam_pred):
     return all_poses
 
 
-def main():
-    args = parse_args()
-    aug_dir = os.path.join(args.episode_dir, 'augmented')
+def collect_episodes(task_dir):
+    return [os.path.join(task_dir, name)
+            for name in sorted(os.listdir(task_dir))
+            if os.path.isdir(os.path.join(task_dir, name))
+            and os.path.exists(os.path.join(task_dir, name, 'meta.json'))]
 
-    with open(os.path.join(args.episode_dir, 'meta.json')) as f:
+
+def process_episode(episode_dir, args, est, gdino, sam_pred):
+    """Track tool pose for one episode. Returns True if work was done."""
+    aug_dir = os.path.join(episode_dir, 'augmented')
+
+    if not os.path.exists(os.path.join(episode_dir, 'meta.json')):
+        print(f"  Skipping {episode_dir} — no meta.json")
+        return False
+
+    out_path = os.path.join(aug_dir, 'tool_poses.npz')
+    if args.skip_done and os.path.exists(out_path):
+        print(f"  Skipping {episode_dir} — already done (tool_poses.npz exists)")
+        return False
+
+    with open(os.path.join(episode_dir, 'meta.json')) as f:
         meta = json.load(f)
 
-    # Decide tracking mode
-    cam_depth_dir   = os.path.join(args.episode_dir, f'cam{args.camera}_depth')
+    cam_depth_dir   = os.path.join(episode_dir, f'cam{args.camera}_depth')
     novel_cams_path = os.path.join(aug_dir, 'novel_cameras.npz')
     use_temporal    = os.path.isdir(cam_depth_dir) and os.path.exists(novel_cams_path)
 
     if use_temporal:
-        print(f"Mode: TEMPORAL TRACKING  (cam{args.camera} RGBD + novel_cameras.npz)")
+        print(f"  Mode: TEMPORAL  (cam{args.camera} RGBD + novel_cameras.npz)")
     else:
-        print("Mode: FALLBACK PER-VIEW REGISTRATION")
+        print("  Mode: FALLBACK PER-VIEW REGISTRATION")
         if not os.path.isdir(cam_depth_dir):
-            print(f"  (no {cam_depth_dir} — re-record with updated 01_record.py for temporal mode)")
+            print(f"    (no cam{args.camera}_depth — re-record for temporal mode)")
         if not os.path.exists(novel_cams_path):
-            print(f"  (no novel_cameras.npz — re-run 02_augment.py for temporal mode)")
+            print(f"    (no novel_cameras.npz — re-run 02_augment.py for temporal mode)")
+
+    # Swap in the episode_dir for helpers that read args.episode_dir
+    orig_ep = args.episode_dir
+    args.episode_dir = episode_dir
+
+    if use_temporal:
+        all_poses, cam_poses = temporal_track(args, meta, aug_dir, est, gdino, sam_pred)
+        cam_out = os.path.join(aug_dir, f'tool_poses_cam{args.camera}.npz')
+        np.savez(cam_out, **{str(k): v for k, v in cam_poses.items()})
+        print(f"  Saved cam{args.camera} poses → {cam_out}")
+
+        # Transform to task/world frame if calibration is available
+        if args.task_frame:
+            tf_world2cam = np.load(args.task_frame)            # (4,4) W2C
+            tf_cam2world = np.linalg.inv(tf_world2cam)         # C2W = T^task_camera
+            task_poses = {k: (tf_cam2world @ v.astype(np.float64)).astype(np.float32)
+                          for k, v in cam_poses.items()}
+            task_out = os.path.join(aug_dir, 'tool_poses_task.npz')
+            np.savez(task_out, **{str(k): v for k, v in task_poses.items()})
+            print(f"  Saved task-frame poses → {task_out}")
+    else:
+        all_poses = fallback_track(args, meta, aug_dir, est, gdino, sam_pred)
+
+    args.episode_dir = orig_ep
+
+    np.savez(out_path, **{str(k): v for k, v in all_poses.items()})
+    print(f"  Saved {len(all_poses)} frame pose groups → {out_path}")
+    return True
+
+
+def main():
+    args = parse_args()
+
+    if args.episode_dir:
+        episode_dirs = [args.episode_dir]
+    else:
+        episode_dirs = collect_episodes(args.task_dir)
+        if not episode_dirs:
+            print(f"No episodes found under {args.task_dir}")
+            return
+        print(f"Found {len(episode_dirs)} episode(s) under {args.task_dir}")
 
     print("\nLoading GroundingDINO + SAM...")
     gdino, sam_pred = load_gdino_sam(args.device)
@@ -304,19 +372,24 @@ def main():
     est = build_estimator(mesh)
     print("  FoundationPose ready.")
 
-    if use_temporal:
-        all_poses, cam0_poses = temporal_track(args, meta, aug_dir, est, gdino, sam_pred)
-        cam0_out = os.path.join(aug_dir, f'tool_poses_cam{args.camera}.npz')
-        np.savez(cam0_out, **{str(k): v for k, v in cam0_poses.items()})
-        print(f"Saved cam{args.camera} poses → {cam0_out}")
-    else:
-        all_poses = fallback_track(args, meta, aug_dir, est, gdino, sam_pred)
+    n_done = n_skip = 0
+    for i, episode_dir in enumerate(episode_dirs):
+        ep_name = os.path.relpath(episode_dir, args.task_dir) if args.task_dir else episode_dir
+        print(f"\n{'='*60}")
+        print(f"Episode {i+1}/{len(episode_dirs)}: {ep_name}")
+        print('='*60)
+        ok = process_episode(episode_dir, args, est, gdino, sam_pred)
+        if ok:
+            n_done += 1
+        else:
+            n_skip += 1
 
-    out_path = os.path.join(aug_dir, 'tool_poses.npz')
-    np.savez(out_path, **{str(k): v for k, v in all_poses.items()})
-    print(f"Saved {len(all_poses)} frame pose groups → {out_path}")
-    print(f"Next: python 05_train.py --data_dir {os.path.dirname(args.episode_dir)} "
-          f"--output_dir data/checkpoints/{meta.get('task','task')}")
+    print(f"\nDone ({n_done} processed, {n_skip} skipped)")
+
+    task_dir = args.task_dir or os.path.dirname(args.episode_dir)
+    task_name = os.path.basename(task_dir)
+    print(f"Next: python 05_train.py --data_dir {task_dir} "
+          f"--output_dir data/checkpoints/{task_name}")
 
 
 if __name__ == '__main__':
