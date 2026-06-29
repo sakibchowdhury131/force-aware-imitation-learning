@@ -6,6 +6,22 @@ A modular re-implementation of the Tool-as-Interface imitation learning pipeline
 
 ---
 
+## Physical setup
+
+| | |
+|---|---|
+| ![Full lab setup — Kinova Jaco2 arm with two RealSense cameras on tripods](media/setup_overview.jpg) | ![Workspace view — RealSense camera, corkboard task surface, pasta container and bowl](media/camera_setup.jpg) |
+| *Full setup: Kinova Jaco2 6DOF arm, two Intel RealSense D435 cameras on tripods, corkboard task workspace* | *Workspace detail: task-frame corkboard, pasta source container, target bowl, and RealSense camera* |
+| ![Robot gripper scooping pasta — close-up](media/robot_scooping_closeup.jpg) | ![Robot scooping pasta — wide shot](media/robot_scooping_wide.jpg) |
+| *Close-up: Jaco2 gripper holding spoon, scooping elbow pasta from container* | *Wide view: robot executing the pastaTransfer task — scoop from box, transfer to bowl* |
+
+**Hardware:**
+- **Robot:** Kinova Jaco2 6DOF spherical-wrist arm (USB SDK)
+- **Cameras:** 2× Intel RealSense D435 (848×480, 30fps RGBD)
+- **Task:** pasta transfer — scoop elbow pasta from a container into a bowl
+
+---
+
 ## Architecture
 
 **Diffusion policy** (DDPM, 100 denoising steps):
