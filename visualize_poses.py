@@ -37,6 +37,9 @@ def parse_args():
                       help='Overlay on unmasked novel/ images instead of masked_novel/')
     mode.add_argument('--use_real',  action='store_true',
                       help='Overlay on real camN/ images using tool_poses_camN.npz')
+    p.add_argument('--use_masked', action='store_true',
+                   help='With --use_real: draw overlay on masked_real/ frames (hand blacked out) '
+                        'instead of raw camN/ frames. Useful to verify masked tracking quality.')
     return p.parse_args()
 
 
@@ -80,7 +83,7 @@ def main():
     to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
     bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
 
-    # ── Real cam0 mode ────────────────────────────────────────────────────────
+    # ── Real cam mode ─────────────────────────────────────────────────────────
     if args.use_real:
         cam_idx    = args.camera
         poses_path = os.path.join(aug_dir, f'tool_poses_cam{cam_idx}.npz')
@@ -88,13 +91,21 @@ def main():
             print(f"ERROR: {poses_path} not found.")
             print(f"  Re-run step 4 with --camera {cam_idx} in temporal mode to generate it.")
             return
-        poses   = dict(np.load(poses_path))   # str(frame_id) → (4, 4)
-        K_use   = np.array(meta['intrinsics'][cam_idx]['K'], dtype=np.float64)
-        cam_dir = os.path.join(args.episode_dir, f'cam{cam_idx}')
+        poses        = dict(np.load(poses_path))   # str(frame_id) → (4, 4)
+        K_use        = np.array(meta['intrinsics'][cam_idx]['K'], dtype=np.float64)
+        cam_dir      = os.path.join(args.episode_dir, f'cam{cam_idx}')
+        masked_dir   = os.path.join(aug_dir, 'masked_real')
+        use_masked   = args.use_masked and os.path.isdir(masked_dir)
+        if args.use_masked and not use_masked:
+            print("WARNING: --use_masked requested but masked_real/ not found — using raw cam frames")
+        print(f"  Source: {'masked_real/' if use_masked else f'cam{cam_idx}/'}")
         total   = 0
         for frame_key, pose in sorted(poses.items(), key=lambda x: int(x[0])):
             frame_id = int(frame_key)
-            img_path = os.path.join(cam_dir, f'{frame_id:06d}.jpg')
+            if use_masked:
+                img_path = os.path.join(masked_dir, f'{frame_id:06d}_cam{cam_idx}.jpg')
+            else:
+                img_path = os.path.join(cam_dir, f'{frame_id:06d}.jpg')
             if not os.path.exists(img_path):
                 continue
             img_rgb  = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)

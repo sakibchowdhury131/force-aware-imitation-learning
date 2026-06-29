@@ -32,91 +32,12 @@ Usage:
 import os, sys, glob, argparse, json
 import numpy as np
 import torch
-import torch.nn as nn
 from PIL import Image
 import cv2
 
-
-# ── Re-create model (must match 05_train.py) ─────────────────────────────────
-
-class DiffusionPolicyNet(nn.Module):
-    def __init__(self, action_dim=9, obs_dim=512, action_horizon=8, n_obs_steps=2):
-        super().__init__()
-        import torchvision.models as tvm
-        backbone = tvm.resnet18(weights=None)
-        self.encoder        = nn.Sequential(*list(backbone.children())[:-1])
-        self.n_obs_steps    = n_obs_steps
-        self.action_horizon = action_horizon
-        self.action_dim     = action_dim
-
-        self.obs_proj = nn.Sequential(
-            nn.Linear(obs_dim * n_obs_steps, obs_dim),
-            nn.SiLU(),
-        )
-        self.time_emb = nn.Sequential(
-            nn.Linear(1, 64), nn.SiLU(), nn.Linear(64, 64),
-        )
-
-        hidden      = 512
-        flat_action = action_dim * action_horizon
-        self.net = nn.ModuleList([
-            nn.Linear(flat_action + 64, hidden),
-            nn.Linear(hidden, hidden),
-            nn.Linear(hidden, hidden),
-            nn.Linear(hidden, flat_action),
-        ])
-        self.film = nn.ModuleList([
-            nn.Linear(obs_dim, hidden * 2) for _ in range(3)
-        ])
-        self.act = nn.SiLU()
-
-    def encode_obs(self, imgs: torch.Tensor) -> torch.Tensor:
-        """imgs: (B, n_obs_steps*3, H, W) → (B, obs_dim)"""
-        frame_imgs = imgs.chunk(self.n_obs_steps, dim=1)
-        embs = [self.encoder(f).squeeze(-1).squeeze(-1) for f in frame_imgs]
-        return self.obs_proj(torch.cat(embs, dim=-1))
-
-    def forward(self, noisy_actions, timesteps, obs_emb):
-        t_emb = self.time_emb(timesteps.float().unsqueeze(-1) / 100.0)
-        x = torch.cat([noisy_actions, t_emb], dim=-1)
-        for i, layer in enumerate(self.net[:-1]):
-            x = layer(x)
-            film_out = self.film[i](obs_emb)
-            scale, shift = film_out.chunk(2, dim=-1)
-            x = x * (1 + scale) + shift
-            x = self.act(x)
-        return self.net[-1](x)
-
-
-# ── Normaliser ────────────────────────────────────────────────────────────────
-
-class MaxAbsNormalizer:
-    def __init__(self, state_dict):
-        self.scale  = state_dict['scale']
-        self.offset = state_dict['offset']
-
-    def denormalize(self, x: np.ndarray) -> np.ndarray:
-        return (x - self.offset) / self.scale
-
-
-# ── Rotation / pose utilities ─────────────────────────────────────────────────
-
-def rot6d_to_matrix(r6d: np.ndarray) -> np.ndarray:
-    """6D → (3,3) rotation matrix via Gram-Schmidt."""
-    a1, a2 = r6d[:3], r6d[3:]
-    b1 = a1 / (np.linalg.norm(a1) + 1e-8)
-    b2 = a2 - np.dot(b1, a2) * b1
-    b2 = b2 / (np.linalg.norm(b2) + 1e-8)
-    b3 = np.cross(b1, b2)
-    return np.stack([b1, b2, b3], axis=1)
-
-
-def action_9d_to_pose(a: np.ndarray) -> np.ndarray:
-    """9D [tx, ty, tz, rot6d] → 4×4 pose matrix."""
-    T = np.eye(4, dtype=np.float64)
-    T[:3, 3]  = a[:3]
-    T[:3, :3] = rot6d_to_matrix(a[3:])
-    return T
+from policy_common import (N_VIEWS, PROPRIO_DIM, pose_matrix_to_9d, rot6d_to_matrix,
+                            action_9d_to_pose, MaxAbsNormalizer, DiffusionPolicyNet,
+                            gather_obs_views)
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
@@ -124,15 +45,24 @@ def action_9d_to_pose(a: np.ndarray) -> np.ndarray:
 def load_model(checkpoint_path, device):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     n_obs_steps    = ckpt.get('n_obs_steps',    2)
+    n_views        = ckpt.get('n_views',        N_VIEWS)
+    proprio_dim    = ckpt.get('proprio_dim',    PROPRIO_DIM)
     action_horizon = ckpt['action_horizon']
+    unet_dims      = ckpt.get('unet_dims',      (256, 512, 1024))
+    unet_kernel    = ckpt.get('unet_kernel',    5)
     model = DiffusionPolicyNet(
         action_dim=9,
         action_horizon=action_horizon,
         n_obs_steps=n_obs_steps,
+        n_views=n_views,
+        proprio_dim=proprio_dim,
+        pretrained=False,
+        unet_dims=tuple(unet_dims),
+        unet_kernel=unet_kernel,
     ).to(device)
     model.load_state_dict(ckpt['model'])
     model.eval()
-    normalizer = MaxAbsNormalizer(ckpt['normalizer'])
+    normalizer = MaxAbsNormalizer.from_state_dict(ckpt['normalizer'])
     return model, normalizer, ckpt
 
 
@@ -147,11 +77,12 @@ def make_transform(image_size, crop_size):
 
 
 @torch.no_grad()
-def predict_action_sequence(model, normalizer, noise_scheduler, img_tensors, device):
+def predict_action_sequence(model, normalizer, noise_scheduler, view_tensors, proprio, device):
     """
     DDPM reverse diffusion over a temporal window.
 
-    img_tensors: list[n_obs_steps] of (3, H, W) tensors, oldest → newest
+    view_tensors: list[n_obs_steps] of (N_VIEWS, 3, H, W) tensors, oldest → newest
+    proprio:      list[n_obs_steps] of (proprio_dim,) arrays — normalised tool pose
     Returns:
       actions: (action_horizon, 9) float64 — denormalized [tx, ty, tz, rot6d]
       poses:   list[action_horizon] of 4×4 np.ndarray
@@ -160,8 +91,9 @@ def predict_action_sequence(model, normalizer, noise_scheduler, img_tensors, dev
     action_horizon = model.action_horizon
     flat           = action_dim * action_horizon
 
-    obs_img = torch.cat(img_tensors, dim=0).unsqueeze(0).to(device)  # (1, n_obs*3, H, W)
-    obs_emb = model.encode_obs(obs_img)
+    obs_imgs  = torch.stack(view_tensors).unsqueeze(0).to(device)  # (1, n_obs_steps, N_VIEWS, 3, H, W)
+    proprio_t = torch.from_numpy(np.stack(proprio).astype(np.float32)).unsqueeze(0).to(device)
+    obs_emb   = model.encode_obs(obs_imgs, proprio_t)
 
     x = torch.randn(1, flat, device=device)
     noise_scheduler.set_timesteps(noise_scheduler.config.num_train_timesteps)
@@ -214,6 +146,68 @@ def draw_axes_simple(img_rgb: np.ndarray, pose: np.ndarray, K: np.ndarray,
                 f"x={t[0]*100:.1f}  y={t[1]*100:.1f}  z={t[2]*100:.1f} cm",
                 (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2, cv2.LINE_AA)
     return vis
+
+
+def draw_axes_with_horizon(img_rgb: np.ndarray, cam_poses: list, K: np.ndarray,
+                            scale: float = 0.06) -> np.ndarray:
+    """
+    Draw step+1 XYZ axes plus a fading dot trail for the full prediction horizon.
+    cam_poses: list of (4,4) poses already in camera frame, oldest=step+1 first.
+    """
+    vis = img_rgb.copy()
+
+    # Draw horizon trail (steps 2..H) as fading yellow dots
+    H = len(cam_poses)
+    for k in range(H - 1, -1, -1):
+        p = cam_poses[k]
+        if p[:3, 3][2] <= 0:
+            continue
+        pts = _project(p[:3, 3].reshape(1, 3), K)
+        if np.any(pts < -2000) or np.any(pts > 20000):
+            continue
+        alpha = 0.3 + 0.7 * (H - k) / H   # step+1 brightest
+        radius = max(3, 8 - k)
+        color = (int(255 * alpha), int(200 * alpha), 0)
+        cv2.circle(vis, tuple(pts[0]), radius, color, -1, cv2.LINE_AA)
+
+    # Draw full XYZ axes at step+1
+    pose = cam_poses[0]
+    if pose[:3, 3][2] > 0:
+        o  = pose[:3, 3]
+        ax = [o + pose[:3, k] * scale for k in range(3)]
+        pts = _project(np.array([o, ax[0], ax[1], ax[2]]), K)
+        if not (np.any(pts < -5000) or np.any(pts > 50000)):
+            origin = tuple(pts[0])
+            colors = [(255, 60, 60), (60, 220, 60), (60, 100, 255)]
+            labels = ['X', 'Y', 'Z']
+            for k in range(3):
+                tip = tuple(pts[k + 1])
+                cv2.arrowedLine(vis, origin, tip, colors[k], 2, tipLength=0.25)
+                cv2.putText(vis, labels[k], tip, cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45, colors[k], 1, cv2.LINE_AA)
+
+    t = cam_poses[0][:3, 3]
+    cv2.putText(vis,
+                f"x={t[0]*100:.1f}  y={t[1]*100:.1f}  z={t[2]*100:.1f} cm",
+                (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2, cv2.LINE_AA)
+    return vis
+
+
+def _compile_video(img_paths: list, out_dir: str, fps: int = 10):
+    if not img_paths:
+        return
+    first = cv2.imread(img_paths[0])
+    if first is None:
+        return
+    h, w = first.shape[:2]
+    out_path = os.path.join(out_dir, 'overlay_video.mp4')
+    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+    for p in img_paths:
+        frame = cv2.imread(p)
+        if frame is not None:
+            writer.write(frame)
+    writer.release()
+    print(f"Saved video → {out_path}")
 
 
 def try_mesh_overlay(img_rgb, pose, K, mesh_path):
@@ -361,7 +355,7 @@ def save_trajectory_plot(out_dir: str, pred_poses: dict, gt_poses: dict = None,
     axes[-1].set_xlabel('Frame index (GT-aligned — each step shifted by its horizon offset)',
                         fontsize=9)
 
-    title = 'Policy prediction horizon — cam0 frame'
+    title = 'Policy prediction horizon — task frame'
     if horizon_steps:
         title += f'  (fan = steps 1–{len(horizon_steps)}, dotted = step+{len(horizon_steps)})'
     axes[0].set_title(title, fontsize=11)
@@ -382,7 +376,8 @@ def save_trajectory_plot(out_dir: str, pred_poses: dict, gt_poses: dict = None,
 
 # ── Modes ─────────────────────────────────────────────────────────────────────
 
-def run_single(args, model, normalizer, noise_scheduler, transform, device, n_obs_steps):
+def run_single(args, model, normalizer, noise_scheduler, transform, device,
+               n_obs_steps, n_views, proprio_dim):
     img_paths = args.images
     if len(img_paths) == 1 and n_obs_steps > 1:
         print(f"  [note: repeating single image for all {n_obs_steps} obs steps]")
@@ -390,11 +385,19 @@ def run_single(args, model, normalizer, noise_scheduler, transform, device, n_ob
     if len(img_paths) != n_obs_steps:
         raise ValueError(f"Expected {n_obs_steps} image(s), got {len(img_paths)}")
 
-    img_tensors = [transform(Image.open(p).convert('RGB')) for p in img_paths]
-    img_rgb     = np.array(Image.open(img_paths[-1]).convert('RGB'))
+    print(f"  [note: --images is a quick sanity check — proprioception is zeroed. "
+          f"For a faithful run, use --episode_dir]")
+
+    view_tensors = []
+    for p in img_paths:
+        t = transform(Image.open(p).convert('RGB'))
+        view_tensors.append(t.unsqueeze(0))   # (N_VIEWS=1, 3, H, W)
+    proprio = [np.zeros(proprio_dim, dtype=np.float32) for _ in range(n_obs_steps)]
+
+    img_rgb = np.array(Image.open(img_paths[-1]).convert('RGB'))
 
     actions, poses = predict_action_sequence(
-        model, normalizer, noise_scheduler, img_tensors, device)
+        model, normalizer, noise_scheduler, view_tensors, proprio, device)
 
     print(f"\nPredicted action sequence ({len(actions)} future steps):")
     for k, a in enumerate(actions):
@@ -418,27 +421,37 @@ def run_single(args, model, normalizer, noise_scheduler, transform, device, n_ob
             print(f"\nSaved overlay → {out}")
 
 
-def run_episode(args, model, normalizer, noise_scheduler, transform, device, n_obs_steps):
-    aug_dir   = os.path.join(args.episode_dir, 'augmented')
-    novel_dir = os.path.join(aug_dir, 'masked_novel')
-    real_dir  = os.path.join(aug_dir, 'masked_real')     # cam0 images, hands removed
-    cam0_dir  = os.path.join(args.episode_dir, 'cam0')   # raw cam0 images fallback
-    out_dir   = args.output_dir or os.path.join(aug_dir, 'policy_predictions')
+def run_episode(args, model, normalizer, noise_scheduler, transform, device,
+                n_obs_steps, n_views, proprio_dim):
+    aug_dir  = os.path.join(args.episode_dir, 'augmented')
+    real_dir = os.path.join(aug_dir, 'masked_real')      # cam0/cam1 images, hands removed
+    cam0_dir = os.path.join(args.episode_dir, 'cam0')    # raw cam0 images fallback
+    out_dir  = args.output_dir or os.path.join(aug_dir, 'policy_predictions')
     os.makedirs(out_dir, exist_ok=True)
 
-    # Group masked novel view images by frame_id (filename: {fid:06d}_novel{k}.jpg)
-    frame_map = {}  # fid_str → sorted list of novel view paths
-    for p in sorted(glob.glob(os.path.join(novel_dir, '*.jpg'))):
-        stem  = os.path.splitext(os.path.basename(p))[0]
-        parts = stem.split('_novel')
-        if len(parts) != 2:
-            continue
-        frame_map.setdefault(parts[0], []).append(p)
-    for fid in frame_map:
-        frame_map[fid].sort()
+    # Tool poses define the frame set — same frames used during training,
+    # each paired with N_VIEWS images (real cam0/cam1 + rendered novel views)
+    base_gt_path = os.path.join(aug_dir, 'tool_poses_base.npz')
+    task_gt_path = os.path.join(aug_dir, 'tool_poses_task.npz')
+    cam0_gt_path = os.path.join(aug_dir, 'tool_poses_cam0.npz')
+    if os.path.exists(base_gt_path):
+        gt_path = base_gt_path
+    elif os.path.exists(task_gt_path):
+        gt_path = task_gt_path
+    else:
+        gt_path = cam0_gt_path
+    if not os.path.exists(gt_path):
+        print(f"No tool poses found under {aug_dir} "
+              f"(need tool_poses_base.npz, tool_poses_task.npz or tool_poses_cam0.npz)")
+        return
 
-    frame_ids = sorted(frame_map.keys())
-    n_frames  = len(frame_ids)
+    poses_raw  = dict(np.load(gt_path))
+    frame_keys = sorted(poses_raw.keys(), key=int)
+    n_frames   = len(frame_keys)
+    frame      = 'base' if gt_path == base_gt_path else ('task' if gt_path == task_gt_path else 'cam0')
+    print(f"  Loaded {n_frames} tool poses ({frame} frame) from {gt_path}")
+
+    gt_poses = {f'{int(k):06d}': v for k, v in poses_raw.items()} if args.plot_trajectory else None
 
     if n_frames < n_obs_steps:
         print(f"Not enough frames ({n_frames}) for n_obs_steps={n_obs_steps}")
@@ -452,13 +465,24 @@ def run_episode(args, model, normalizer, noise_scheduler, transform, device, n_o
             meta = json.load(f)
         K_cam0 = np.array(meta['intrinsics'][0]['K'], dtype=np.float64)
 
-    # Ground-truth poses for trajectory comparison
-    gt_poses = None
-    gt_path  = os.path.join(aug_dir, 'tool_poses_cam0.npz')
-    if args.plot_trajectory and os.path.exists(gt_path):
-        raw = dict(np.load(gt_path))
-        gt_poses = {f'{int(k):06d}': v for k, v in raw.items()}
-        print(f"  Loaded {len(gt_poses)} ground-truth poses from {gt_path}")
+    # Camera extrinsics for task→cam reprojection (and base→task if frame == 'base')
+    tf_world2cam = None
+    if getattr(args, 'task_frame', None) and os.path.exists(args.task_frame):
+        tf_world2cam = np.load(args.task_frame).astype(np.float64)
+        print(f"  Loaded camera extrinsics from {args.task_frame}")
+    elif args.overlay:
+        print("  [warn] --overlay without --task_frame: predictions in task frame, "
+              "projection will be wrong unless poses are already in cam0 frame")
+
+    T_task_base = None  # inv(T_base_task): base -> task frame
+    if frame == 'base':
+        if getattr(args, 'robot_extrinsics', None) and os.path.exists(args.robot_extrinsics):
+            T_base_task = np.load(args.robot_extrinsics).astype(np.float64)
+            T_task_base = np.linalg.inv(T_base_task)
+            print(f"  Loaded robot extrinsics from {args.robot_extrinsics}")
+        elif args.overlay:
+            print("  [warn] --overlay with base-frame poses but no --robot_extrinsics: "
+                  "projection will be wrong")
 
     want_overlay = args.overlay or args.mesh
     all_poses    = {}
@@ -468,14 +492,25 @@ def run_episode(args, model, normalizer, noise_scheduler, transform, device, n_o
     print(f"Running inference on {n_windows} windows → {out_dir}/")
 
     for i in range(n_obs_steps - 1, n_frames):
-        obs_fids    = frame_ids[i - n_obs_steps + 1 : i + 1]
-        img_tensors = [transform(Image.open(frame_map[fid][0]).convert('RGB'))
-                       for fid in obs_fids]
+        obs_keys = frame_keys[i - n_obs_steps + 1 : i + 1]
+
+        view_tensors, proprio, skip = [], [], False
+        for k in obs_keys:
+            paths = gather_obs_views(aug_dir, k)
+            if paths is None:
+                print(f"  [skip] frame {int(k):06d}: no masked images found")
+                skip = True
+                break
+            view_tensors.append(torch.stack(
+                [transform(Image.open(p).convert('RGB')) for p in paths]))
+            proprio.append(normalizer.normalize(pose_matrix_to_9d(poses_raw[k])))
+        if skip:
+            continue
 
         actions, poses = predict_action_sequence(
-            model, normalizer, noise_scheduler, img_tensors, device)
+            model, normalizer, noise_scheduler, view_tensors, proprio, device)
 
-        fid_str = frame_ids[i]
+        fid_str = f'{int(frame_keys[i]):06d}'
         all_poses[fid_str] = poses[0].astype(np.float32)
         all_seqs[fid_str]  = actions.astype(np.float32)
 
@@ -483,22 +518,36 @@ def run_episode(args, model, normalizer, noise_scheduler, transform, device, n_o
         print(f"  frame {fid_str}  next: x={t[0]*100:.1f} y={t[1]*100:.1f} z={t[2]*100:.1f} cm")
 
         if want_overlay and K_cam0 is not None:
-            # Prefer real cam0 image — pose is in cam0 frame so projection is exact
-            cam0_img_path = (os.path.join(real_dir, f'{fid_str}.jpg')
-                             if os.path.isdir(real_dir)
-                             else os.path.join(cam0_dir,  f'{fid_str}.jpg'))
-            if not os.path.exists(cam0_img_path):
-                # Last resort: novel view (approximate; pose frame differs)
-                cam0_img_path = frame_map[fid_str][0]
+            # Prefer hand-removed cam0 image (masked_real uses {fid}_cam0.jpg naming)
+            cam0_img_path = None
+            for candidate in [
+                os.path.join(real_dir, f'{fid_str}_cam0.jpg'),   # masked_real naming
+                os.path.join(real_dir, f'{fid_str}.jpg'),         # alternate naming
+                os.path.join(cam0_dir,  f'{fid_str}.jpg'),        # raw cam0
+            ]:
+                if os.path.exists(candidate):
+                    cam0_img_path = candidate
+                    break
+            if cam0_img_path is None:
+                cam0_img_path = gather_obs_views(aug_dir, obs_keys[-1])[0]  # last resort
 
             img_rgb = np.array(Image.open(cam0_img_path).convert('RGB'))
 
-            if args.mesh:
-                vis = try_mesh_overlay(img_rgb, poses[0], K_cam0, args.mesh)
-                if vis is None:
-                    vis = draw_axes_simple(img_rgb, poses[0], K_cam0)
+            # Convert predicted poses → camera frame for correct projection
+            # (base -> task -> cam, or task -> cam if not base-frame)
+            if frame == 'base' and T_task_base is not None and tf_world2cam is not None:
+                cam_poses = [tf_world2cam @ T_task_base @ p.astype(np.float64) for p in poses]
+            elif tf_world2cam is not None:
+                cam_poses = [tf_world2cam @ p.astype(np.float64) for p in poses]
             else:
-                vis = draw_axes_simple(img_rgb, poses[0], K_cam0)
+                cam_poses = [p.astype(np.float64) for p in poses]
+
+            if args.mesh:
+                vis = try_mesh_overlay(img_rgb, cam_poses[0], K_cam0, args.mesh)
+                if vis is None:
+                    vis = draw_axes_with_horizon(img_rgb, cam_poses, K_cam0)
+            else:
+                vis = draw_axes_with_horizon(img_rgb, cam_poses, K_cam0)
 
             if vis is not None:
                 cv2.imwrite(os.path.join(out_dir, f'{fid_str}_pred.jpg'),
@@ -509,7 +558,11 @@ def run_episode(args, model, normalizer, noise_scheduler, transform, device, n_o
     print(f"\nSaved {len(all_poses)} windows → {out_dir}/")
 
     if want_overlay:
-        print(f"View overlays:  eog {out_dir}/*_pred.jpg")
+        overlay_imgs = sorted(glob.glob(os.path.join(out_dir, '*_pred.jpg')))
+        if overlay_imgs:
+            _compile_video(overlay_imgs, out_dir)
+        else:
+            print(f"View overlays:  eog {out_dir}/*_pred.jpg")
 
     if args.plot_trajectory:
         save_trajectory_plot(out_dir, all_poses, gt_poses, all_seqs)
@@ -526,9 +579,15 @@ def parse_args():
                           'One image is OK — repeated for all obs steps.')
     src.add_argument('--episode_dir', help='Episode directory; sliding window over masked_novel/')
     p.add_argument('--overlay',          action='store_true',
-                   help='Draw XYZ axes on real cam0 images (no mesh required)')
+                   help='Draw XYZ axes + horizon trail on real cam0 images')
     p.add_argument('--plot_trajectory',  action='store_true',
-                   help='Save tx/ty/tz trajectory plot; includes GT if tool_poses_cam0.npz exists')
+                   help='Save tx/ty/tz trajectory plot; includes GT if tool_poses_task.npz exists')
+    p.add_argument('--task_frame', default=None,
+                   help='Path to cam_extrinsics.npy — converts task-frame predictions to '
+                        'cam0 frame for correct image projection (required for --overlay)')
+    p.add_argument('--robot_extrinsics', default=None,
+                   help='Path to robot_extrinsics.npy (T_base_task) — required for --overlay '
+                        'when poses are in robot-base frame (tool_poses_base.npz)')
     p.add_argument('--mesh',       default=None, help='Tool mesh for 3D bbox overlay (.obj/.ply)')
     p.add_argument('--output_dir', default=None, help='Where to save outputs')
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -545,6 +604,8 @@ def main():
     image_size      = ckpt.get('image_size', 128)
     crop_size       = ckpt.get('crop_size',  115)
     n_obs_steps     = ckpt.get('n_obs_steps', 2)
+    n_views         = ckpt.get('n_views',     N_VIEWS)
+    proprio_dim     = ckpt.get('proprio_dim', PROPRIO_DIM)
     action_horizon  = ckpt['action_horizon']
     noise_scheduler = ckpt['noise_scheduler']
     noise_scheduler.set_timesteps(noise_scheduler.config.num_train_timesteps)
@@ -552,14 +613,17 @@ def main():
     args.crop_size = crop_size
     transform = make_transform(image_size, crop_size)
 
-    print(f"Model: obs_steps={n_obs_steps}  action_horizon={action_horizon}  "
+    print(f"Model: obs_steps={n_obs_steps}  n_views={n_views}  proprio_dim={proprio_dim}  "
+          f"action_horizon={action_horizon}  "
           f"image={image_size}×{image_size} → crop {crop_size}×{crop_size}  "
           f"device={args.device}")
 
     if args.images:
-        run_single(args, model, normalizer, noise_scheduler, transform, device, n_obs_steps)
+        run_single(args, model, normalizer, noise_scheduler, transform, device,
+                   n_obs_steps, n_views, proprio_dim)
     else:
-        run_episode(args, model, normalizer, noise_scheduler, transform, device, n_obs_steps)
+        run_episode(args, model, normalizer, noise_scheduler, transform, device,
+                    n_obs_steps, n_views, proprio_dim)
 
 
 if __name__ == '__main__':

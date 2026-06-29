@@ -11,7 +11,7 @@ Two modes depending on available data:
 
     Requires:
       data/episodes/<task>/<ep>/camN_depth/     (recorded by 01_record.py)
-      data/episodes/<task>/<ep>/augmented/novel_cameras.npz  (saved by 02_augment.py)
+      data/episodes/<task>/<ep>/augmented/novel_cameras.npz  (saved by 02_augment_noposplat.py)
 
   FALLBACK (per-view registration, no real depth needed):
     Segments and registers every masked novel view independently using either
@@ -62,8 +62,10 @@ def parse_args():
     src.add_argument('--task_dir',    help='Task directory; processes all episodes')
     p.add_argument('--tool_prompt', default='hammer')
     p.add_argument('--mesh',        required=True, help='Path to tool mesh (.obj or .ply)')
-    p.add_argument('--camera',      type=int, default=0,
+    p.add_argument('--track_cam',   type=int, default=0,
                    help='Camera index to use for real RGBD tracking (default: 0)')
+    p.add_argument('--camera',      type=int, default=None,
+                   help='Alias for --track_cam (deprecated)')
     p.add_argument('--box_threshold',    type=float, default=0.3)
     p.add_argument('--text_threshold',   type=float, default=0.25)
     p.add_argument('--est_refine_iter',  type=int,   default=5)
@@ -72,12 +74,23 @@ def parse_args():
                    help='Fallback depth (m) when DA2 maps are absent')
     p.add_argument('--skip_done', action='store_true',
                    help='Skip episodes that already have tool_poses.npz')
+    p.add_argument('--use_masked', action='store_true',
+                   help='Use hand-masked RGB frames (augmented/masked_real/) instead of '
+                        'raw camN/ frames for tracking. Depth is still loaded from '
+                        'camN_depth/ unmasked. Requires step 3 (--cam_only) to have run.')
     p.add_argument('--task_frame', default=None,
                    help='Path to cam_extrinsics.npy (from 00_calibrate.py). '
-                        'When provided, tool poses are transformed to task/world frame '
-                        'and saved as tool_poses_task.npz in addition to cam0 poses.')
+                        'Defaults to data/cam_extrinsics.npy for cam0, '
+                        'data/cam1_extrinsics.npy for cam1, etc.')
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    return p.parse_args()
+    args = p.parse_args()
+    if args.camera is not None:
+        args.track_cam = args.camera
+    args.camera = args.track_cam   # internal alias used throughout
+    if args.task_frame is None:
+        args.task_frame = ('data/cam_extrinsics.npy' if args.track_cam == 0
+                           else f'data/cam{args.track_cam}_extrinsics.npy')
+    return args
 
 
 def load_gdino_sam(device):
@@ -153,8 +166,10 @@ def build_estimator(mesh):
 
 def temporal_track(args, meta, aug_dir, est, gdino, sam_pred):
     """
-    Register on camN frame 0, track through sequence, transform each tracked
-    pose into all novel-view frames using novel_cameras.npz.
+    Register on camN frame 0, track through sequence.
+    If novel_cameras.npz exists, also transforms poses to novel-view frames.
+    If not (e.g. step 2 hasn't run yet), skips that step — still saves
+    cam-frame and task-frame poses which are all that training needs.
     """
     cam_idx     = args.camera
     cam0_dir    = os.path.join(args.episode_dir, f'cam{cam_idx}')
@@ -163,23 +178,43 @@ def temporal_track(args, meta, aug_dir, est, gdino, sam_pred):
     K_cam0      = np.array(meta['intrinsics'][cam_idx]['K'], dtype=np.float64)
 
     novel_cams_path = os.path.join(aug_dir, 'novel_cameras.npz')
-    novel_cams = dict(np.load(novel_cams_path))
+    have_novel_cams = os.path.exists(novel_cams_path)
 
-    cam_key_suffix = f'_cam{cam_idx}_w2c'
-    frame_ids = sorted({int(k.split('_')[0])
-                        for k in novel_cams if k.endswith(cam_key_suffix)})
-    if not frame_ids:
-        raise RuntimeError(
-            f"novel_cameras.npz has no '{cam_key_suffix}' entries — "
-            f"re-run 02_augment.py (which now saves both cameras).")
-    print(f"Temporal tracking: {len(frame_ids)} frames in cam{cam_idx} space")
+    if have_novel_cams:
+        novel_cams     = dict(np.load(novel_cams_path))
+        cam_key_suffix = f'_cam{cam_idx}_w2c'
+        frame_ids = sorted({int(k.split('_')[0])
+                            for k in novel_cams if k.endswith(cam_key_suffix)})
+        if not frame_ids:
+            raise RuntimeError(
+                f"novel_cameras.npz has no '{cam_key_suffix}' entries — "
+                f"re-run 02_augment_noposplat.py (which saves both cameras).")
+    else:
+        # No novel views yet — derive frame list directly from cam directory
+        novel_cams = None
+        frame_ids  = sorted(
+            int(os.path.splitext(f)[0])
+            for f in os.listdir(cam0_dir) if f.endswith('.jpg'))
+
+    masked_real_dir = os.path.join(aug_dir, 'masked_real')
+    use_masked = args.use_masked and os.path.isdir(masked_real_dir)
+    if args.use_masked and not use_masked:
+        print("  WARNING: --use_masked requested but masked_real/ not found — using raw cam frames")
+
+    print(f"Temporal tracking: {len(frame_ids)} frames in cam{cam_idx} space"
+          + ("" if have_novel_cams else "  (no novel_cameras.npz — cam/task poses only)")
+          + ("  [RGB from masked_real/]" if use_masked else ""))
 
     all_poses     = {}
     cam0_poses    = {}   # raw FoundationPose output in cam0 frame
     pose = None
 
     for idx, fi in enumerate(tqdm(frame_ids, unit='frame')):
-        rgb_path   = os.path.join(cam0_dir,  f'{fi:06d}.jpg')
+        # RGB: use hand-masked frames if --use_masked, otherwise raw cam frames
+        if use_masked:
+            rgb_path = os.path.join(masked_real_dir, f'{fi:06d}_cam{cam_idx}.jpg')
+        else:
+            rgb_path = os.path.join(cam0_dir, f'{fi:06d}.jpg')
         depth_path = os.path.join(depth_dir, f'{fi:06d}.png')
 
         rgb_bgr = cv2.imread(rgb_path)
@@ -206,19 +241,19 @@ def temporal_track(args, meta, aug_dir, est, gdino, sam_pred):
         if pose is None:
             pose = np.eye(4, dtype=np.float32)
 
-        cam0_poses[fi] = pose.astype(np.float32)   # save raw cam0 pose
+        cam0_poses[fi] = pose.astype(np.float32)   # save raw cam pose
 
-        # Transform camN pose → each novel-view frame
-        tag           = f'{fi:06d}'
-        cam0_w2c      = novel_cams[f'{tag}_cam{cam_idx}_w2c']  # (4, 4)
-        novel_w2c     = novel_cams[f'{tag}_novel_w2c']          # (N, 4, 4)
-        cam0_to_world = np.linalg.inv(cam0_w2c)
-
-        poses = []
-        for k in range(len(novel_w2c)):
-            pose_novel_k = novel_w2c[k] @ cam0_to_world @ pose
-            poses.append(pose_novel_k.astype(np.float32))
-        all_poses[fi] = np.stack(poses)   # (N_novel, 4, 4)
+        # Transform camN pose → each novel-view frame (only if step 2 has run)
+        if have_novel_cams:
+            tag           = f'{fi:06d}'
+            cam0_w2c      = novel_cams[f'{tag}_cam{cam_idx}_w2c']  # (4, 4)
+            novel_w2c     = novel_cams[f'{tag}_novel_w2c']          # (N, 4, 4)
+            cam0_to_world = np.linalg.inv(cam0_w2c)
+            poses = []
+            for k in range(len(novel_w2c)):
+                pose_novel_k = novel_w2c[k] @ cam0_to_world @ pose
+                poses.append(pose_novel_k.astype(np.float32))
+            all_poses[fi] = np.stack(poses)   # (N_novel, 4, 4)
 
     return all_poses, cam0_poses
 
@@ -310,16 +345,15 @@ def process_episode(episode_dir, args, est, gdino, sam_pred):
 
     cam_depth_dir   = os.path.join(episode_dir, f'cam{args.camera}_depth')
     novel_cams_path = os.path.join(aug_dir, 'novel_cameras.npz')
-    use_temporal    = os.path.isdir(cam_depth_dir) and os.path.exists(novel_cams_path)
+    use_temporal    = os.path.isdir(cam_depth_dir)   # depth is all we need
 
     if use_temporal:
-        print(f"  Mode: TEMPORAL  (cam{args.camera} RGBD + novel_cameras.npz)")
+        has_novel = os.path.exists(novel_cams_path)
+        print(f"  Mode: TEMPORAL  (cam{args.camera} RGBD"
+              + ("  + novel_cameras.npz" if has_novel else "  — no novel views yet") + ")")
     else:
         print("  Mode: FALLBACK PER-VIEW REGISTRATION")
-        if not os.path.isdir(cam_depth_dir):
-            print(f"    (no cam{args.camera}_depth — re-record for temporal mode)")
-        if not os.path.exists(novel_cams_path):
-            print(f"    (no novel_cameras.npz — re-run 02_augment.py for temporal mode)")
+        print(f"    (no cam{args.camera}_depth — re-record for temporal mode)")
 
     # Swap in the episode_dir for helpers that read args.episode_dir
     orig_ep = args.episode_dir
