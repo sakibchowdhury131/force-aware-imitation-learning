@@ -57,7 +57,43 @@ def parse_args():
                    help='Camera index to use for FP tracking preview (default: 0). '
                         'All cameras are always recorded; this only affects the live overlay.')
     p.add_argument('--device', default='cuda')
-    return p.parse_args()
+    # Auto-track: run accurate offline FoundationPose tracking (step 4) right after
+    # recording finishes, on the same episode, in the same process.
+    p.add_argument('--auto_track', action='store_true',
+                   help='After recording, automatically run step-4-equivalent offline tracking '
+                        '(saves tool_poses_cam{N}.npz / tool_poses_task.npz), reusing the already-'
+                        'loaded FP/GDINO/SAM models when possible. Requires --mesh. Always tracks '
+                        'RAW frames, never masked_real/ -- masked tracking was found to silently '
+                        'freeze near occlusion (see README known-issues), so step 3 is skipped '
+                        'entirely for auto-tracked episodes.')
+    p.add_argument('--auto_track_refine_iter', type=int, default=5,
+                   help='track_refine_iter for the auto-track pass (default 5, HIGHER than the '
+                        'live-preview default of 2 -- the live preview stays cheap/fast for '
+                        'real-time feedback; this pass runs after recording with no fps pressure, '
+                        'and low iteration counts were found to cause severe drift on long episodes)')
+    p.add_argument('--auto_track_est_refine_iter', type=int, default=8,
+                   help='est_refine_iter (initial registration) for the auto-track pass (default 8)')
+    p.add_argument('--task_frame', default=None,
+                   help='Path to cam extrinsics for the auto-track task-frame conversion. '
+                        'Defaults to data/cam{track_cam}_extrinsics.npy.')
+    p.add_argument('--skip_auto_visualize', action='store_true',
+                   help='With --auto_track: skip the automatic visualize_poses.py sanity-check '
+                        'pass after tracking (it runs by default).')
+    args = p.parse_args()
+    if args.auto_track and args.mesh is None:
+        p.error('--auto_track requires --mesh (and --tool_prompt) to track')
+    return args
+
+
+def _load_04_track_module():
+    """'04_track' starts with a digit, not a valid module name for `import` --
+    load it by file path instead. Only called when --auto_track is used."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        '_track04', os.path.join(PIPELINE_DIR, '04_track.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # ── FoundationPose helpers ───────────────────────────────────────────────────
@@ -382,9 +418,67 @@ def main():
         json.dump(meta, f, indent=2)
 
     print(f"\nSaved {saved} frames to '{episode_dir}/'")
-    print(f"Next: python 02_augment_noposplat.py --episode_dir {episode_dir} "
-          f"--noposplat_root ~/working_dir/NoPoSplat --input_mode letterbox "
-          f"--no_antialias --sample_every 1 --num_novel_views 6")
+
+    if args.auto_track:
+        print("\n" + "=" * 60)
+        print("AUTO-TRACK — accurate offline FoundationPose tracking (step 4 equivalent)")
+        print("=" * 60)
+
+        aug_dir = os.path.join(episode_dir, 'augmented')
+        os.makedirs(aug_dir, exist_ok=True)   # process_episode's np.savez needs this to exist
+
+        auto_task_frame = args.task_frame or (
+            'data/cam_extrinsics.npy' if args.track_cam == 0
+            else f'data/cam{args.track_cam}_extrinsics.npy')
+
+        track04 = _load_04_track_module()
+        track_args = argparse.Namespace(
+            episode_dir=episode_dir,
+            tool_prompt=args.tool_prompt,
+            camera=args.track_cam,
+            box_threshold=args.box_threshold,
+            text_threshold=args.text_threshold,
+            est_refine_iter=args.auto_track_est_refine_iter,
+            track_refine_iter=args.auto_track_refine_iter,
+            use_masked=False,   # raw frames only, see --auto_track help
+            task_frame=auto_task_frame,
+            device=args.device,
+            skip_done=False,
+        )
+
+        # Reuse the live-preview's already-loaded models (same mesh) when available,
+        # to avoid loading a second FoundationPose/GroundingDINO/SAM stack.
+        if use_fp:
+            track_est, track_gdino, track_sam = fp_est, gdino, sam_pred
+        else:
+            print("  Loading GroundedSAM + FoundationPose for auto-track "
+                  "(preview overlay was off, so nothing was loaded yet)...")
+            track_gdino, track_sam = track04.load_gdino_sam(args.device)
+            track_mesh = track04.load_mesh(args.mesh)
+            track_est = track04.build_estimator(track_mesh)
+
+        track04.process_episode(episode_dir, track_args, track_est, track_gdino, track_sam)
+        print("AUTO-TRACK done.")
+
+        if not args.skip_auto_visualize:
+            print("\nRunning visualize_poses.py for a sanity-check overlay...")
+            import subprocess
+            subprocess.run([
+                sys.executable, os.path.join(PIPELINE_DIR, 'visualize_poses.py'),
+                '--episode_dir', episode_dir,
+                '--mesh', args.mesh,
+                '--use_real', '--camera', str(args.track_cam),
+            ], check=False)
+            print(f"Inspect: eog {aug_dir}/viz_poses/*_cam{args.track_cam}_pose.jpg")
+            print("Check the box stays locked on the tool through the WHOLE clip -- "
+                  "not just the start -- before trusting this episode.")
+
+        print(f"\nNext: python 04c_to_base_frame.py --episode_dir {episode_dir} "
+              f"--robot_extrinsics data/robot_extrinsics_stick_corrected_zmeasured.npy")
+    else:
+        print(f"Next: python 02_augment_noposplat.py --episode_dir {episode_dir} "
+              f"--noposplat_root ~/working_dir/NoPoSplat --input_mode letterbox "
+              f"--no_antialias --sample_every 1 --num_novel_views 6")
 
 
 if __name__ == '__main__':

@@ -1,50 +1,70 @@
 """
-Step 7 — Deploy the trained diffusion policy on the real Kinova Jaco2 6DOF
-spherical-wrist arm (fingers rigidly holding the tool, e.g. the spoon).
+Step 7 variant — like 07_deploy.py (blocking/wait_convergence position control),
+but for force-conditioned checkpoints (05_train_replay_force.py, proprio_dim=12/
+action_dim=12 = [pose9, force3]): the predicted future force is used as a
+time-varying admittance reference alongside the predicted position, instead of
+position alone. Does NOT modify 07_deploy.py -- this is a full copy with the
+force machinery layered in. Also works with ordinary 9D checkpoints (falls
+back to pure position control, admittance correction always zero) so the same
+script can A/B the two.
 
-Pipeline (mirrors the original Tool-as-Interface real-robot deployment,
-adapted to the Kinova Jaco2 USB SDK used by 00_calibrate.py / 06_calibrate_robot.py):
+WHY A COPY, NOT A FLAG ON 07_deploy.py: per the same reasoning used for every
+other prototype this session (benchmark_*.py, deploy_streaming.py) -- keep
+07_deploy.py's proven, already-validated position-only path completely
+untouched for future evaluation runs, and iterate on the new mechanism here.
 
-  1. Robot forward kinematics gives T_base_eef every step (no per-step
-     FoundationPose tracking — avoids tracking drift). Combined with the
-     one-time rigid grasp offset T_tool_eef, this gives T_base_tool, the
-     proprioceptive signal x^r — directly in the robot-base frame, the same
-     frame the policy was trained on (tool_poses_base.npz).
-  2. GroundedSAM masks the robot arm/gripper out of the cam0 image (blacked
-     out), mirroring how the training data had the human demonstrator's
-     hand/arm masked out — keeps the observation distribution consistent.
-  3. The diffusion policy (policy_final.pt) takes the last n_obs_steps
-     (image, proprio) pairs and predicts action_horizon future tool poses,
-     directly in the robot-base frame.
-  4. Tool->gripper transform T_tool_eef is calibrated ONCE at startup (rigid
-     grasp assumption), via FoundationPose registration + the
-     camera->task->base chain (cam_extrinsics.npy, T_base_task):
-        T_base_tool_0 = T_base_task @ inv(tf_world2cam) @ T_cam_tool_0
-        T_tool_eef    = inv(T_base_tool_0) @ T_base_eef_0
-     Then for every predicted tool pose (already in base frame):
-        T_base_eef = T_base_tool_pred @ T_tool_eef
-     This is the ONLY place cam_extrinsics.npy / T_base_task are used —
-     camera recalibration after this one-time step no longer affects action
-     correctness.
-  5. Receding horizon: execute the first --exec_steps predicted poses (with
-     per-step translation/rotation clamping for safety), then re-observe and
-     replan.
+HYBRID POSITION+FORCE MECHANISM (the new part):
+  Each inference call returns, per horizon step, both a predicted pose (as
+  before) and a predicted force reference f_desired(t) (new -- only present
+  when the checkpoint has predicts_force=True). At execution time, for
+  whichever predicted step is about to be sent:
+    correction = clip_magnitude(K^-1 * (F_live_filtered - f_desired), max_cm)
+    T_base_eef_pred[:3,3] += correction        (base-frame wrench == base-frame
+                                                 translation, contact_detector.
+                                                 torque_to_wrench's return frame
+                                                 -- no extra conversion needed)
+  then clamp_pose_step() runs exactly as in 07_deploy.py, UNCHANGED, on the
+  corrected target. This ordering is deliberate: the force correction can only
+  ever be as large as the existing max_trans_step/max_rot_step safety clamp
+  allows, same as a bad position prediction would be -- it cannot bypass that
+  safeguard by construction, not by convention.
+  --admittance (default OFF) gates whether the correction is ever nonzero;
+  --force_safety_threshold zeroes the correction (not the whole command) if
+  live |F| exceeds it, on the theory that a bad correction shouldn't be
+  trusted, but the underlying position prediction still might be fine.
 
-SAFETY:
-  --dry_run (default) only prints/logs target poses and saves a debug video —
-  no robot motion. Once the printed targets look sane (smooth, small steps,
-  near the current tool position), re-run with --execute.
-  Press Q in the preview window to stop — EraseAllTrajectories() is called
-  and the arm holds its last commanded position.
+FORCE PIPELINE (live): the FULL 3-stage chain analyze_replay_full.py uses to
+build replay_full_forces.npz's external_force_xyz (what 05_train_replay_force.py's
+training labels actually are) -- firmware gravity-free torque, minus the
+linear gravity-regressor residual, minus the NN gravity residual, minus the
+mass/Coriolis dynamics-regressor prediction (contact_detector.
+full_dynamics_regressor @ --dynamics_pi, qddot estimated live via
+contact_detector.VelocityDifferentiator), through contact_detector.
+torque_to_wrench (base frame, EEF origin). NOTE: deploy_streaming.py's 100Hz
+loop and an earlier version of this function both left the dynamics-regressor
+stage out (confirmed too slow for 100Hz, ~26Hz max / 39ms per call) -- but
+that constraint doesn't apply at THIS script's 10Hz rate (well under half the
+tick budget), and omitting it meant live force was on a different correction
+chain than the training labels the whole time. Tared for --tare_duration
+seconds at startup (pose-dependent bias, same finding as every other force
+script this session), then a CAUSAL (online, stateful) Butterworth low-pass
+at the checkpoint's own --force_cutoff_hz (read from ckpt['force_cutoff_hz'],
+defaults to 2.0 if absent) -- fs is THIS control loop's --frequency (10Hz
+default), not the 100Hz deploy_streaming.py used, since the filter has to be
+built for whatever rate it's actually fed at.
 
-Usage:
-  # Dry run (no robot motion) — verify perception + predicted targets
-  python 07_deploy.py --checkpoint data/checkpoints/pastaTransfer/policy_final.pt \\
-      --mesh spoon.obj --tool_prompt "spoon"
+Usage (dry run, force-conditioned checkpoint, position-only i.e. no --admittance):
+    python 07_deploy_force.py \\
+        --checkpoint data/checkpoints/PastaTransfer_force_replay_force/policy_final.pt \\
+        --no_arm_mask \\
+        --robot_extrinsics data/robot_extrinsics_stick_corrected_zmeasured.npy \\
+        --robot_extrinsics_proprio data/robot_extrinsics_stick_corrected_zmeasured.npy \\
+        --mesh newspoon1.obj --tool_prompt "spoon" --track_cam 1 \\
+        --init_episode_dir data/episodes/PastaTransfer_force/021 --init_frame 0 \\
+        --wait_convergence
 
-  # Execute on the real arm
-  python 07_deploy.py --checkpoint data/checkpoints/pastaTransfer/policy_final.pt \\
-      --mesh spoon.obj --tool_prompt "spoon" --execute
+Usage (hybrid position+force, real motion):
+    ... --admittance --K 200 --wait_convergence --execute
 """
 
 import os, sys, time, ctypes, argparse, threading, collections
@@ -71,6 +91,11 @@ from policy_common import pose_matrix_to_9d
 from test_policy import (load_model, make_transform, predict_action_sequence,
                          predict_action_sequence_flow, predict_action_sequence_act,
                          _project, draw_axes_with_horizon, draw_axes_simple)
+from contact_detector import (torque_to_wrench, gravity_regressor, compute_jacobian,
+                              full_dynamics_regressor, VelocityDifferentiator)
+from fit_gravity_residual_nn import GravityResidualNet, predict as predict_gravity_residual
+from scipy.signal import butter, sosfilt, sosfilt_zi
+
 _ROBOT_UNET_H, _ROBOT_UNET_W = 288, 512
 _ROBOT_UNET_MEAN = [0.485, 0.456, 0.406]
 _ROBOT_UNET_STD  = [0.229, 0.224, 0.225]
@@ -110,7 +135,6 @@ def unet_mask(model, img_rgb, threshold, device):
 
 # ════════════════════════════════════════════════════════════════════════════
 # Joint-angle forward kinematics (same DH chain as deploy_viz.py)
-# Used for proprio — more accurate than GetCartesianPosition for spoon height.
 # ════════════════════════════════════════════════════════════════════════════
 
 _PI = np.pi
@@ -134,8 +158,6 @@ def _make_fk_T(xyz, rpy):
 
 
 def joint_angles_to_eef(q_deg: np.ndarray) -> np.ndarray:
-    """Return 4×4 EEF pose in robot base frame from joint angles (degrees).
-    Matches the FK chain in deploy_viz.py — aligns with the gold spoon mesh."""
     from scipy.spatial.transform import Rotation
     q = np.deg2rad(q_deg)
     T = np.eye(4, dtype=np.float64)
@@ -147,7 +169,8 @@ def joint_angles_to_eef(q_deg: np.ndarray) -> np.ndarray:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Kinova Jaco2 USB SDK bindings (CARTESIAN_POSITION trajectory control)
+# Kinova Jaco2 USB SDK bindings (CARTESIAN_POSITION trajectory control +
+# gravity-free torque read, needed for the live force pipeline)
 # ════════════════════════════════════════════════════════════════════════════
 
 NO_ERROR_KINOVA   = 1
@@ -217,6 +240,8 @@ def load_api():
         ("StopControlAPI", ctypes.c_int),
         ("GetCartesianPosition", ctypes.c_int),
         ("GetAngularPosition",   ctypes.c_int),
+        ("GetAngularForceGravityFree", ctypes.c_int),   # new vs. 07_deploy.py -- live force pipeline
+        ("GetAngularVelocity",   ctypes.c_int),          # for qddot estimation -- mass/Coriolis correction
         ("SetCartesianControl", ctypes.c_int),
         ("SendBasicTrajectory", ctypes.c_int),
         ("EraseAllTrajectories", ctypes.c_int),
@@ -272,6 +297,28 @@ def get_joint_angles_deg(api) -> np.ndarray:
                      a.Actuator4, a.Actuator5, a.Actuator6], dtype=np.float64)
 
 
+def get_qdot_deg(api) -> np.ndarray:
+    """Joint angular velocity (deg/s) -- needed to estimate qddot for the
+    mass/Coriolis dynamics regressor correction (contact_detector.
+    full_dynamics_regressor), matching analyze_replay_full.py's training-label
+    pipeline."""
+    pos = AngularPosition()
+    api.GetAngularVelocity(ctypes.byref(pos))
+    a = pos.Actuators
+    return np.array([a.Actuator1, a.Actuator2, a.Actuator3,
+                     a.Actuator4, a.Actuator5, a.Actuator6], dtype=np.float64)
+
+
+def get_tau_gf(api) -> np.ndarray:
+    """Firmware gravity-free joint torque (Nm) -- same reader as
+    deploy_streaming.py/calibrate_firmware_gravity.py."""
+    pos = AngularPosition()
+    api.GetAngularForceGravityFree(ctypes.byref(pos))
+    a = pos.Actuators
+    return np.array([a.Actuator1, a.Actuator2, a.Actuator3,
+                     a.Actuator4, a.Actuator5, a.Actuator6], dtype=np.float64)
+
+
 def get_cartesian_pose(api) -> np.ndarray:
     """Returns [X, Y, Z, ThetaX, ThetaY, ThetaZ] (metres, radians)."""
     pos = CartesianPosition()
@@ -285,11 +332,6 @@ def get_cartesian_pose(api) -> np.ndarray:
 def send_cartesian_pose(api, xyz_theta: np.ndarray,
                          trans_speed: float = 0.0,
                          rot_speed: float = 0.0):
-    """Send a CARTESIAN_POSITION trajectory point (fingers untouched).
-
-    trans_speed: max translation speed in m/s (0 = use robot default, ~slow)
-    rot_speed:   max rotation speed in rad/s  (0 = use robot default)
-    """
     tp = TrajectoryPoint()
     ctypes.memset(ctypes.byref(tp), 0, ctypes.sizeof(tp))
     tp.Position.Type = CARTESIAN_POSITION
@@ -302,20 +344,14 @@ def send_cartesian_pose(api, xyz_theta: np.ndarray,
     tp.Position.HandMode = HAND_NOMOVEMENT
     if trans_speed > 0 or rot_speed > 0:
         tp.LimitationsActive = 1
-        tp.Limitations.speedParameter1 = float(trans_speed)  # m/s translation
-        tp.Limitations.speedParameter2 = float(rot_speed)    # rad/s rotation
+        tp.Limitations.speedParameter1 = float(trans_speed)
+        tp.Limitations.speedParameter2 = float(rot_speed)
     api.SendBasicTrajectory(tp)
 
-
-# ── Pose <-> Kinova Cartesian conversion ──────────────────────────────────────
-# Kinova convention: orientation is Euler-XYZ with Rot = Rx(ThetaX) @ Ry(ThetaY) @ Rz(ThetaZ),
-# which is scipy's intrinsic 'XYZ' Euler convention.
 
 def kinova_pose_to_matrix(xyz_theta: np.ndarray) -> np.ndarray:
     from scipy.spatial.transform import Rotation
     T = np.eye(4, dtype=np.float64)
-    # Kinova SDK uses intrinsic XYZ (body-fixed roll-pitch-yaw).
-    # Must match matrix_to_kinova_pose which uses as_euler('XYZ').
     T[:3, :3] = Rotation.from_euler('XYZ', xyz_theta[3:]).as_matrix()
     T[:3, 3]  = xyz_theta[:3]
     return T
@@ -325,6 +361,26 @@ def matrix_to_kinova_pose(T: np.ndarray) -> np.ndarray:
     from scipy.spatial.transform import Rotation
     theta = Rotation.from_matrix(T[:3, :3]).as_euler('XYZ')
     return np.concatenate([T[:3, 3], theta])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Live force pipeline (full gravity+mass/Coriolis chain -- see module docstring)
+# ════════════════════════════════════════════════════════════════════════════
+
+class OnlineButterworth:
+    """Causal 2nd-order low-pass with persistent state -- duplicated from
+    deploy_streaming.py rather than imported, same reasoning: each deployment
+    script is meant to be readable/runnable standalone. One instance per
+    scalar channel."""
+    def __init__(self, cutoff_hz: float, fs_hz: float, order: int = 2):
+        self.sos = butter(order, cutoff_hz, btype='low', fs=fs_hz, output='sos')
+        self._zi = None
+
+    def update(self, x: float) -> float:
+        if self._zi is None:
+            self._zi = sosfilt_zi(self.sos) * x
+        y, self._zi = sosfilt(self.sos, [x], zi=self._zi)
+        return float(y[0])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -440,12 +496,11 @@ def apply_mask(img_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Safety: per-step pose clamping
+# Safety: per-step pose clamping (unchanged from 07_deploy.py)
 # ════════════════════════════════════════════════════════════════════════════
 
 def clamp_pose_step(T_current: np.ndarray, T_target: np.ndarray,
                      max_trans: float, max_rot_rad: float) -> np.ndarray:
-    """Limit the per-command translation/rotation delta from T_current to T_target."""
     from scipy.spatial.transform import Rotation, Slerp
 
     t_cur, t_tgt = T_current[:3, 3], T_target[:3, 3]
@@ -486,86 +541,70 @@ def parse_args():
     p.add_argument('--unet_threshold', type=float, default=0.5,
                    help='Sigmoid threshold for UNet arm mask')
     p.add_argument('--no_arm_mask', action='store_true',
-                   help='Feed the RAW (unmasked) camera image to the policy instead of masking '
-                        'the robot arm out. Use this if the policy was trained on unmasked '
-                        'images (e.g. replay images, which show the robot arm itself rather '
-                        'than a human hand) -- masking live but training unmasked (or vice '
-                        'versa) is a train/deploy mismatch. --unet_checkpoint becomes optional.')
+                   help='Feed the RAW (unmasked) camera image to the policy. Use this for '
+                        'replay-image-trained checkpoints (05_train_replay.py/'
+                        '05_train_replay_force.py), which is what this script is meant for.')
     p.add_argument('--task_frame', default=None,
                    help='tf_world2cam from 00_calibrate.py. Defaults to '
                         'data/cam_extrinsics.npy for cam0, data/cam1_extrinsics.npy for cam1.')
     p.add_argument('--robot_extrinsics', default='data/robot_extrinsics.npy',
-                   help='T_base_task from 06_calibrate_robot.py — used for converting '
-                        'policy predictions (task frame) to robot commands (base frame).')
+                   help='T_base_task from 06_calibrate_robot.py.')
     p.add_argument('--robot_extrinsics_proprio', default=None,
-                   help='Optional separate T_base_task for proprioception, calibrated with '
-                        'joint-angle FK (06_calibrate_robot.py --use_joint_fk). If omitted, '
-                        'falls back to --robot_extrinsics. Use this when GetCartesianPosition '
-                        'and the joint-angle FK disagree on EEF height.')
-    p.add_argument('--track_cam', type=int, default=0,
-                   help='Camera index to use for FP tracking and policy observation (default: 0). '
-                        'Must match --track_cam used in 00_calibrate.py, 04_track.py, 05_train.py.')
-    p.add_argument('--camera', type=int, default=None,
-                   help='Alias for --track_cam (deprecated)')
+                   help='Optional separate T_base_task for proprioception (joint-FK calibration).')
+    p.add_argument('--track_cam', type=int, default=0)
+    p.add_argument('--camera', type=int, default=None, help='Alias for --track_cam (deprecated)')
     p.add_argument('--box_threshold',  type=float, default=0.3)
     p.add_argument('--text_threshold', type=float, default=0.25)
     p.add_argument('--est_refine_iter',   type=int, default=5)
     p.add_argument('--track_refine_iter', type=int, default=2)
-    p.add_argument('--tool_eef_cache', default='data/T_tool_eef.npy',
-                   help='Cache for the rigid spoon->gripper offset T_tool_eef. Once calibrated, '
-                        'this fixed mechanical offset is reused on every run regardless of '
-                        'camera position, so camera recalibration no longer affects action '
-                        'correctness. Delete the file or pass --recalibrate_tool_eef to redo it.')
-    p.add_argument('--recalibrate_tool_eef', action='store_true',
-                   help='Recompute T_tool_eef via FoundationPose registration even if a cached '
-                        'value exists, and overwrite the cache.')
-    p.add_argument('--T_eef_spoon', default='data/T_eef_spoon.npy',
-                   help='EEF→spoon calibration from calib_viz_3d.py. When present, skips '
-                        'per-step FoundationPose tracking entirely — FK + this offset drives '
-                        'proprio and spoon viz. Delete to fall back to FP tracking.')
-    p.add_argument('--init_episode_dir', default=None,
-                   help='Episode directory (e.g. data/episodes/PastaTransfer_force/021) whose '
-                        '--init_frame tool pose (augmented/tool_poses_base.npz, base frame) the '
-                        'robot moves to ONCE, unclamped, before the policy control loop starts — '
-                        'puts deployment in a known training-distribution starting pose instead '
-                        'of wherever the arm was last left. Mirrors replay_episode.py\'s '
-                        'pre-position-to-frame[0] step. Requires --execute to actually move (dry '
-                        'run just prints the target and distance). Omit to skip entirely '
-                        '(default: unchanged behavior).')
-    p.add_argument('--init_frame', type=int, default=0,
-                   help='Frame ID within --init_episode_dir to pre-position to (default: 0, the '
-                        'episode\'s first tracked frame).')
+    p.add_argument('--tool_eef_cache', default='data/T_tool_eef.npy')
+    p.add_argument('--recalibrate_tool_eef', action='store_true')
+    p.add_argument('--T_eef_spoon', default='data/T_eef_spoon.npy')
+    p.add_argument('--init_episode_dir', default=None)
+    p.add_argument('--init_frame', type=int, default=0)
     p.add_argument('--frequency', type=float, default=10.0,
-                   help='Control loop rate (Hz). Must match training: record_fps / subsample. '
-                        'E.g. 30fps recording with --subsample 3 → 10 Hz; --subsample 2 → 15 Hz.')
-    p.add_argument('--exec_steps', type=int, default=8,
-                   help='Actions to execute per inference cycle (receding horizon). '
-                        'Inference fires when 2 actions remain, giving 2/frequency seconds of runway.')
-    p.add_argument('--max_steps', type=int, default=0,
-                   help='Stop after this many control iterations (0 = run until Q)')
-    p.add_argument('--max_trans_step', type=float, default=0.02,
-                   help='Max per-command translation step (metres) — safety clamp')
-    p.add_argument('--max_rot_step_deg', type=float, default=10.0,
-                   help='Max per-command rotation step (degrees) — safety clamp')
-    p.add_argument('--arm_trans_speed', type=float, default=0.0,
-                   help='Cartesian translation speed limit sent to Kinova (m/s). '
-                        '0 = robot default (slow). Try 0.15–0.25 for faster execution.')
-    p.add_argument('--step_mode', action='store_true',
-                   help='Step-by-step execution: send one action, wait for convergence, '
-                        'then block until SPACE is pressed before sending the next. '
-                        'Useful for manual inspection. Combine with --wait_convergence.')
-    p.add_argument('--execute', action='store_true',
-                   help='Actually send commands to the robot (default: dry run / print only)')
-    p.add_argument('--wait_convergence', action='store_true',
-                   help='After each command, poll GetCartesianPosition until the EEF reaches the '
-                        'target (within --convergence_threshold) before sending the next command. '
-                        'Replaces the fixed-frequency sleep. Requires --execute.')
-    p.add_argument('--convergence_threshold', type=float, default=0.010,
-                   help='EEF position threshold (metres) for --wait_convergence. Default: 1 cm.')
-    p.add_argument('--convergence_timeout', type=float, default=0.5,
-                   help='Max seconds to wait per step in --wait_convergence mode. Default: 0.5 s.')
-    p.add_argument('--output_dir', default='/tmp/policy_deploy')
+                   help='Control loop rate (Hz). Also the live force filter\'s sample rate.')
+    p.add_argument('--exec_steps', type=int, default=8)
+    p.add_argument('--max_steps', type=int, default=0)
+    p.add_argument('--max_trans_step', type=float, default=0.02)
+    p.add_argument('--max_rot_step_deg', type=float, default=10.0)
+    p.add_argument('--arm_trans_speed', type=float, default=0.0)
+    p.add_argument('--step_mode', action='store_true')
+    p.add_argument('--execute', action='store_true')
+    p.add_argument('--wait_convergence', action='store_true')
+    p.add_argument('--convergence_threshold', type=float, default=0.010)
+    p.add_argument('--convergence_timeout', type=float, default=0.5)
+    p.add_argument('--output_dir', default='/tmp/policy_deploy_force')
     p.add_argument('--device', default='cuda')
+    # ── New: hybrid position+force ────────────────────────────────────────────
+    p.add_argument('--admittance', action='store_true',
+                   help='Enable the force-admittance correction (requires a predicts_force '
+                        'checkpoint). Without this: pure position control, correction always 0 '
+                        '-- lets the same script/checkpoint serve as a position-only baseline.')
+    p.add_argument('--K', type=float, default=200.0, help='Admittance stiffness, N/m.')
+    p.add_argument('--f_max_correction_cm', type=float, default=2.0,
+                   help='Cap on the admittance correction magnitude (cm), vector-norm-capped '
+                        '(not per-axis) -- see benchmark_force_admittance.py for why per-axis '
+                        'clipping is wrong (lets the combined magnitude exceed the cap).')
+    p.add_argument('--force_cutoff_hz', type=float, default=None,
+                   help='Live force low-pass cutoff (Hz). Defaults to the checkpoint\'s own '
+                        'force_cutoff_hz (how its training labels were filtered) if present, '
+                        'else 2.0.')
+    p.add_argument('--tare_duration', type=float, default=1.0,
+                   help='Seconds of force samples to average at startup as the resting-bias tare.')
+    p.add_argument('--force_safety_threshold', type=float, default=15.0,
+                   help='If live |F| exceeds this (N), zero the correction this step (not the '
+                        'whole command) rather than trust it.')
+    p.add_argument('--damping', type=float, default=0.05,
+                   help='Tikhonov damping for the torque->wrench pinv (contact_detector.py).')
+    p.add_argument('--dynamics_pi', default='data/dynamics_residual_pi.npy',
+                   help='Mass/Coriolis regressor parameters (contact_detector.'
+                        'full_dynamics_regressor), same file analyze_replay_full.py used to '
+                        'build the training-label force -- keeps live force on the same '
+                        'correction chain as what the model was trained on.')
+    p.add_argument('--qddot_smoothing', type=float, default=0.3,
+                   help='EMA smoothing for the live qddot estimate (contact_detector.'
+                        'VelocityDifferentiator) -- matches analyze_replay_full.py\'s default.')
     return p.parse_args()
 
 
@@ -584,7 +623,6 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Create cv2 windows FIRST — OpenGL context must exist before CUDA/nvdiffrast.
     cv2.namedWindow("Deploy",      cv2.WINDOW_NORMAL)
     cv2.namedWindow("Policy View", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Deploy",      848, 480)
@@ -597,8 +635,6 @@ def main():
     print(f"Loaded tf_world2cam from {args.task_frame}")
     print(f"Loaded T_base_task (commands) from {args.robot_extrinsics}")
 
-    # Separate T_base_task for proprio — calibrated with joint-angle FK so that
-    # the computed spoon pose matches the gold-mesh position in deploy_viz.
     _prop_path = args.robot_extrinsics_proprio or args.robot_extrinsics
     T_base_task_prop = np.load(_prop_path).astype(np.float64)
     _using_separate_prop = (args.robot_extrinsics_proprio is not None
@@ -615,9 +651,22 @@ def main():
     n_obs_steps  = ckpt.get('n_obs_steps', 2)
     n_views      = ckpt.get('n_views', 1)
     action_frame = ckpt.get('action_frame', 'task')
-    # train_method absent -> 'ddpm': every checkpoint saved before flow-matching/ACT
-    # support was added takes this path, unchanged from the original behavior.
     train_method = ckpt.get('train_method', 'ddpm')
+    predicts_force = ckpt.get('predicts_force', False)
+    # force_in_proprio: whether the OBSERVATION includes force (proprio_dim=12),
+    # independent of whether the ACTION target also includes force
+    # (predicts_force). The conditioning-only variant (05_train_replay_force.py
+    # --no_predict_force) has force_in_proprio=True, predicts_force=False --
+    # gating proprio construction on predicts_force alone (the original
+    # version of this check) would silently build a 9D proprio for that
+    # checkpoint, a shape mismatch against its 12D-proprio model. Old
+    # checkpoints predating this field don't have it stored; default to
+    # matching predicts_force, which is exactly correct for them (force was
+    # never conditioning-only before this variant existed).
+    force_in_proprio = ckpt.get('force_in_proprio', predicts_force)
+    force_dim      = ckpt.get('force_dim', 3)
+    force_cutoff_hz = args.force_cutoff_hz if args.force_cutoff_hz is not None \
+        else ckpt.get('force_cutoff_hz', 2.0)
     noise_scheduler = None
     flow_time_scale, flow_ode_steps = None, None
     if train_method == 'ddpm':
@@ -627,26 +676,32 @@ def main():
         flow_time_scale = ckpt.get('time_scale', 999.0)
         flow_ode_steps  = ckpt.get('ode_steps', 50)
     elif train_method == 'act':
-        pass   # single forward pass, no scheduler/ODE state needed
+        pass
     else:
-        raise SystemExit(f"Unsupported train_method '{train_method}' in checkpoint "
-                         f"(no deploy-time inference path for it yet).")
+        raise SystemExit(f"Unsupported train_method '{train_method}'.")
     transform = make_transform(image_size, crop_size)
     print(f"Model: obs_steps={n_obs_steps}  n_views={n_views}  action_horizon={model.action_horizon}  "
-          f"train_method={train_method}  "
+          f"train_method={train_method}  proprio_dim={model.proprio_dim}  action_dim={model.action_dim}  "
           f"image={image_size}x{image_size} -> crop {crop_size}x{crop_size}  action_frame={action_frame}")
+    if force_in_proprio:
+        print(f"  force_in_proprio=True (force_dim={force_dim})  predicts_force={predicts_force}  "
+              f"{'admittance ENABLED' if args.admittance else 'admittance disabled (--admittance to turn on)'}  "
+              f"force_cutoff_hz={force_cutoff_hz}")
+    if args.admittance and not predicts_force:
+        raise SystemExit("--admittance requires a predicts_force checkpoint "
+                         "(this one has predicts_force=False/absent) -- a conditioning-only "
+                         "checkpoint has no predicted force to use as the admittance reference.")
 
     # ── Load UNet arm segmentor ──────────────────────────────────────────────
     unet = None
     if args.no_arm_mask:
-        print("--no_arm_mask set: feeding the RAW camera image to the policy "
-             "(UNet arm segmentor NOT loaded).")
+        print("--no_arm_mask set: feeding the RAW camera image to the policy.")
     else:
         print(f"Loading UNet arm segmentor: {args.unet_checkpoint}")
         unet = load_unet(args.unet_checkpoint, device)
         print(f"  threshold={args.unet_threshold}")
 
-    # ── Load mesh for to_origin (always needed for proprio + action decoding) ───
+    # ── Load mesh for to_origin ───────────────────────────────────────────────
     import trimesh
     print(f"Loading mesh: {args.mesh}")
     loaded = trimesh.load(args.mesh)
@@ -657,30 +712,25 @@ def main():
         mesh.apply_scale(0.01)
     to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
     inv_to_origin = np.linalg.inv(to_origin)
-    bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
 
-    # ── T_eef_spoon: FK-based proprio (no per-step FP needed) ────────────────
+    # ── T_eef_spoon: FK-based proprio ─────────────────────────────────────────
     eef_spoon_path = os.path.join(PIPELINE_DIR, args.T_eef_spoon)
     T_eef_spoon = None
     if os.path.exists(eef_spoon_path):
         T_eef_spoon = np.load(eef_spoon_path).astype(np.float64)
-        # T_base_tool = T_base_eef @ T_eef_spoon @ to_origin  (matches training convention)
-        # T_tool_eef  = inv_to_origin @ inv(T_eef_spoon)      (for action → EEF)
         T_tool_eef_from_calib = inv_to_origin @ np.linalg.inv(T_eef_spoon)
         t = T_eef_spoon[:3, 3]
         print(f"Loaded T_eef_spoon from {eef_spoon_path} "
               f"(t={t[0]*100:.1f},{t[1]*100:.1f},{t[2]*100:.1f} cm)")
         print("  → FK-based proprio mode: FoundationPose NOT used per-step.")
 
-    # ── Load GDino + SAM + FP only when T_eef_spoon absent or T_tool_eef missing ─
-    # Only load FP when we can't derive T_tool_eef from T_eef_spoon
     need_fp = T_eef_spoon is None
     need_registration = (not os.path.exists(args.tool_eef_cache)
                          or args.recalibrate_tool_eef)
 
     est = gdino = sam_pred = None
     if need_fp:
-        print("Loading GroundedSAM + FoundationPose (T_eef_spoon not found or T_tool_eef cache missing)...")
+        print("Loading GroundedSAM + FoundationPose...")
         gdino, sam_pred = load_gdino_sam(args.device)
         from estimater import FoundationPose, ScorePredictor, PoseRefinePredictor
         import nvdiffrast.torch as dr
@@ -715,14 +765,10 @@ def main():
         print("\n*** DRY RUN — no commands will be sent to the robot. Use --execute to enable. ***\n")
 
     try:
-        # ── T_tool_eef: for converting predicted tool poses → EEF commands ──────
+        # ── T_tool_eef ─────────────────────────────────────────────────────────
         if T_eef_spoon is not None:
-            # Derived analytically from calib_viz_3d.py calibration — no FP needed
             T_tool_eef = T_tool_eef_from_calib
             print(f"T_tool_eef derived from T_eef_spoon (no FP registration needed).")
-
-            # Still run FP registration once if we need to seed est.track_one for
-            # the fallback visualization path (only when est was loaded).
             if est is not None:
                 print(f"\nRegistering tool ('{args.tool_prompt}') for FP viz only...")
                 rgb, depth = capture(pipe, align, depth_scale)
@@ -733,7 +779,6 @@ def main():
                                  iteration=args.est_refine_iter)
                     print("  FP registered (viz only).")
         else:
-            # Fall back to FP-based T_tool_eef (original behaviour)
             print(f"\nRegistering tool ('{args.tool_prompt}') for FP tracking...")
             rgb, depth = capture(pipe, align, depth_scale)
             mask = segment(gdino, sam_pred, rgb, args.tool_prompt,
@@ -758,11 +803,7 @@ def main():
                 T_tool_eef = np.load(args.tool_eef_cache).astype(np.float64)
                 print(f"Loaded cached T_tool_eef from {args.tool_eef_cache}")
 
-        # ── Optional pre-positioning: move to a training episode's initial pose ──
-        # Mirrors replay_episode.py's "pre-position to frame[0], unclamped" step —
-        # the arm is otherwise wherever it was last left, which may be far outside
-        # anything the policy saw in training. Same T_base_tool @ T_tool_eef
-        # conversion used everywhere else in this file for predicted-pose -> EEF.
+        # ── Optional pre-positioning ───────────────────────────────────────────
         if args.init_episode_dir:
             init_pose_path = os.path.join(args.init_episode_dir, 'augmented', 'tool_poses_base.npz')
             init_poses = np.load(init_pose_path)
@@ -794,49 +835,98 @@ def main():
             else:
                 print("  (dry run — not moving; pass --execute to actually pre-position)")
 
+        # ── Live force pipeline setup: ALWAYS runs, regardless of predicts_force.
+        # Originally gated behind `if predicts_force:` since only the hybrid
+        # controller consumed it -- but reading/logging live force is useful
+        # diagnostic information on its own (e.g. comparing live force against
+        # recorded-episode drift patterns) even when running a plain 9D
+        # position-only checkpoint with no admittance correction. ─────────────
+        gravity_phi = np.load('data/gravity_phi_task_only.npy')
+        _nn_ckpt = torch.load('data/gravity_residual_nn.pt', weights_only=False)
+        gravity_nn = GravityResidualNet()
+        gravity_nn.load_state_dict(_nn_ckpt['state_dict'])
+        gravity_nn.eval()
+        g_x_mean, g_x_std = _nn_ckpt['x_mean'], _nn_ckpt['x_std']
+        dynamics_pi = np.load(args.dynamics_pi)
+        qdiff = VelocityDifferentiator(smoothing=args.qddot_smoothing)
+
+        # Full gravity + mass/Coriolis correction -- matches analyze_replay_full.py's
+        # 3-stage chain EXACTLY (firmware -> +gravity regressor+NN -> +mass/Coriolis
+        # regressor), which is what produces external_force_xyz in
+        # replay_full_forces.npz, i.e. what 05_train_replay_force.py's training
+        # labels actually are. The earlier version of this function only did the
+        # first two stages (copied from deploy_streaming.py's 100Hz loop, where
+        # the dynamics regressor was confirmed too slow -- 39ms/call, ~26Hz max --
+        # but that constraint doesn't apply at this script's 10Hz rate, where it
+        # uses well under half the tick budget). Skipping it meant every "live
+        # force" this script ever read was on a different correction chain than
+        # what the model was trained on.
+        def read_F_raw(q_deg, qdot_deg, t):
+            gf = get_tau_gf(api)
+            g_res_lin = gravity_regressor(q_deg) @ gravity_phi
+            g_res_nn  = predict_gravity_residual(gravity_nn, g_x_mean, g_x_std, q_deg)
+            tau_after_gravity = gf - g_res_lin - g_res_nn
+            qddot_deg = qdiff.update(qdot_deg, t)
+            dyn_pred = full_dynamics_regressor(q_deg, qdot_deg, qddot_deg) @ dynamics_pi
+            tau_final = tau_after_gravity - dyn_pred
+            return torque_to_wrench(q_deg, tau_final, damping=args.damping)[:3]
+
+        print(f"\nTaring: capturing baseline for {args.tare_duration:.1f}s -- leave the arm untouched")
+        n_tare = max(1, int(args.tare_duration * args.frequency))
+        tare_samples = []
+        for _ in range(n_tare):
+            q0 = get_joint_angles_deg(api)
+            qdot0 = get_qdot_deg(api)
+            tare_samples.append(read_F_raw(q0, qdot0, time.time()))
+        tare_offset = np.mean(tare_samples, axis=0)
+        print(f"  tare offset (N): [{tare_offset[0]:+.3f}, {tare_offset[1]:+.3f}, {tare_offset[2]:+.3f}]")
+
+        force_filters = [OnlineButterworth(force_cutoff_hz, args.frequency) for _ in range(3)]
+
+        def read_live_force_filtered():
+            """Live, tared, causally-filtered [Fx,Fy,Fz] (base frame, EEF origin) --
+            same convention 05_train_replay_force.py's training labels use."""
+            q_deg = get_joint_angles_deg(api)
+            qdot_deg = get_qdot_deg(api)
+            F_raw = read_F_raw(q_deg, qdot_deg, time.time()) - tare_offset
+            return np.array([force_filters[i].update(F_raw[i]) for i in range(3)])
+
         # ── Receding-horizon control loop ────────────────────────────────────
-        # Design: one outer iteration = one control step (dt = 1/frequency).
-        # obs_buffer is a rolling deque updated every step — so both obs frames
-        # passed to inference are captured during robot motion, not while stopped.
-        # Inference runs in a background thread kicked off when the action deque
-        # drops to exec_steps//2 remaining, so new actions are ready before the
-        # deque empties (zero-pause receding horizon).
         dt           = 1.0 / args.frequency
         max_rot_step = np.radians(args.max_rot_step_deg)
 
-        # Rolling obs buffer: always the last n_obs_steps frames
         obs_buffer = collections.deque(maxlen=n_obs_steps)
-
-        # Action deque: predicted tool poses (base frame) consumed 1-per-step
+        # Action deque: (T_pred (4,4) tool pose base frame, f_pred (3,) desired
+        # force or zeros if not predicts_force) tuples, consumed 1-per-step.
         action_deque = collections.deque()
 
-        # Async inference state (thread-safe via lock)
         _infer_lock    = threading.Lock()
         _infer_running = [False]
-        _infer_result  = [None]   # list of (pred_horizon,4,4) poses once ready
+        _infer_result  = [None]
 
         def _infer_thread(buf_snap):
             view_tensors = [v[0] for v in buf_snap]
             proprio_list = [v[1] for v in buf_snap]
             if train_method == 'flow_matching':
-                _, poses = predict_action_sequence_flow(
+                actions_raw, poses = predict_action_sequence_flow(
                     model, normalizer, view_tensors, proprio_list, device,
                     time_scale=flow_time_scale, ode_steps=flow_ode_steps)
             elif train_method == 'act':
-                _, poses = predict_action_sequence_act(
+                actions_raw, poses = predict_action_sequence_act(
                     model, normalizer, view_tensors, proprio_list, device)
             else:
-                _, poses = predict_action_sequence(
+                actions_raw, poses = predict_action_sequence(
                     model, normalizer, noise_scheduler, view_tensors, proprio_list, device)
+            if predicts_force:
+                forces_pred = actions_raw[:, 9:9 + force_dim]   # already denormalized (Newtons)
+            else:
+                forces_pred = np.zeros((len(poses), 3))
             with _infer_lock:
-                _infer_result[0]  = poses     # full pred_horizon poses
+                _infer_result[0]  = list(zip(poses, forces_pred))
                 _infer_running[0] = False
 
-        # T_base_eef_cur tracks the last clamped command (for the clamp-step check).
         T_base_eef_cur = kinova_pose_to_matrix(get_cartesian_pose(api))
-
-        # Last known set of predicted poses for visualisation (updated on each inference)
-        latest_poses_base = None
+        latest_actions_base = None   # list of (pose, force) tuples, for viz
 
         step = 0
         paused = False
@@ -847,12 +937,23 @@ def main():
         print("P = pause/resume | Q = quit\n")
         prev_cmd_xyz_base = None
         cmd_xyz_base = None
+        correction = np.zeros(3)   # visualization reads this every iteration, even while paused
+        F_live = None
+        # NaN placeholders: only meaningful when action_deque has an action to
+        # execute this tick -- stay NaN on "waiting for inference"/paused ticks,
+        # so a force-vs-position-priority analysis can distinguish "no action
+        # this tick" from a genuine zero correction.
+        pos_cur_before = np.full(3, np.nan)
+        pos_pred_raw   = np.full(3, np.nan)
+        pos_clamped    = np.full(3, np.nan)
+        t_run_start = time.time()
+        log = {'t': [], 'F_live': [], 'q_deg': [], 'pos_cur_before': [], 'pos_pred_raw': [],
+              'correction': [], 'pos_clamped': []}
         while True:
             t_loop_start = time.time()
-            prev_cmd_xyz_base = cmd_xyz_base  # save last iteration's command before resetting
-            cmd_xyz_base = None  # will be set when a command is sent this iteration
+            prev_cmd_xyz_base = cmd_xyz_base
+            cmd_xyz_base = None
 
-            # ── Key handling (always, even when paused) ───────────────────────
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 print("\nQ pressed — stopping.")
@@ -868,8 +969,8 @@ def main():
                     print("  Press P to resume.")
                     print(f"{'─'*50}")
                 else:
-                    obs_buffer.clear()        # flush stale obs so next infer uses fresh frames
-                    latest_poses_base = None
+                    obs_buffer.clear()
+                    latest_actions_base = None
                     print("\n  *** RESUMED ***\n")
 
             # ── 1. Capture + get tool pose ────────────────────────────────────
@@ -877,24 +978,16 @@ def main():
             q_deg = get_joint_angles_deg(api)
 
             if T_eef_spoon is not None:
-                # Joint-angle FK for proprio — matches the gold-mesh position in
-                # deploy_viz and the actual physical spoon, unlike GetCartesianPosition
-                # which can have a systematic Z offset on the Kinova Jaco2.
                 T_base_eef_fk = joint_angles_to_eef(q_deg)
                 T_base_tool   = T_base_eef_fk @ T_eef_spoon @ to_origin
                 pose_cam      = None
             else:
-                # Original FP-based tracking
                 pose_cam    = est.track_one(rgb=rgb, depth=depth, K=K,
                                             iteration=args.track_refine_iter)
                 T_base_tool = T_base_task_prop @ tf_cam2world @ pose_cam.astype(np.float64)
-            # Use T_base_task_prop (joint-FK calibration) so that task-frame proprio
-            # matches the FoundationPose-tracked training observations.
             T_task_tool = np.linalg.inv(T_base_task_prop) @ T_base_tool
 
-            # ── 2. Mask + encode obs (both cameras if dual-cam) ──────────────
-            # robot_mask is also used below for the red visualization overlay even
-            # when --no_arm_mask is set, so it's always computed if the UNet is loaded.
+            # ── 2. Mask + encode obs ──────────────────────────────────────────
             if args.no_arm_mask:
                 robot_mask = np.zeros(rgb.shape[:2], dtype=bool)
                 masked_rgb = rgb
@@ -923,10 +1016,16 @@ def main():
             else:
                 img_t = img_t_main.unsqueeze(0)
 
-            # Proprio in the frame the policy was trained on (from checkpoint)
+            # Live force reading (once per loop iteration -- used for BOTH the
+            # past-force proprio feature and the admittance correction, same
+            # value, same as how proprio pose is reused for both purposes).
+            F_live = read_live_force_filtered()
+
             T_proprio = T_task_tool if action_frame == 'task' else T_base_tool
-            proprio = normalizer.normalize(pose_matrix_to_9d(T_proprio))
-            obs_buffer.append((img_t, proprio))   # rolling — always kept fresh
+            proprio_9d = pose_matrix_to_9d(T_proprio)
+            proprio_raw = np.concatenate([proprio_9d, F_live]) if force_in_proprio else proprio_9d
+            proprio = normalizer.normalize(proprio_raw)
+            obs_buffer.append((img_t, proprio))
 
             T_base_eef_now = kinova_pose_to_matrix(get_cartesian_pose(api))
 
@@ -934,9 +1033,9 @@ def main():
                 # ── 3. Collect completed inference result ─────────────────────
                 with _infer_lock:
                     if _infer_result[0] is not None:
-                        latest_poses_base = _infer_result[0]
+                        latest_actions_base = _infer_result[0]
                         action_deque.clear()
-                        action_deque.extend(latest_poses_base[:args.exec_steps])
+                        action_deque.extend(latest_actions_base[:args.exec_steps])
                         _infer_result[0] = None
 
                 # ── 4. Kick off next inference when deque is low ──────────────
@@ -954,22 +1053,52 @@ def main():
 
                 # ── 5. Execute one action from deque ──────────────────────────
                 _action_sent = False
+                correction = np.zeros(3)
                 if action_deque:
-                    T_pred = action_deque.popleft().astype(np.float64)
+                    T_pred, f_desired = action_deque.popleft()
+                    T_pred = T_pred.astype(np.float64)
                     if action_frame == 'task':
                         T_base_tool_pred = T_base_task @ T_pred
                     else:
                         T_base_tool_pred = T_pred
-                    T_base_eef_pred    = T_base_tool_pred @ T_tool_eef
+                    T_base_eef_pred = T_base_tool_pred @ T_tool_eef
+                    pos_cur_before = T_base_eef_cur[:3, 3].copy()
+                    pos_pred_raw = T_base_eef_pred[:3, 3].copy()   # BEFORE admittance correction
+
+                    # ── Hybrid position+force: admittance correction BEFORE
+                    # clamping, so the existing max_trans_step/max_rot_step
+                    # safety clamp still bounds the final commanded step
+                    # regardless of what the correction computed. ─────────────
+                    if args.admittance and predicts_force:
+                        F_mag = float(np.linalg.norm(F_live))
+                        if F_mag > args.force_safety_threshold:
+                            print(f"  [SAFETY] |F|={F_mag:.1f}N > threshold "
+                                  f"{args.force_safety_threshold:.1f}N -- zeroing correction "
+                                  f"this step (position target unaffected)")
+                        else:
+                            correction = (F_live - f_desired) / args.K
+                            cap = args.f_max_correction_cm / 100
+                            mag = np.linalg.norm(correction)
+                            if mag > cap:
+                                correction = correction * (cap / mag)
+                        T_base_eef_pred[:3, 3] += correction
+
                     T_base_eef_clamped = clamp_pose_step(
                         T_base_eef_cur, T_base_eef_pred,
                         args.max_trans_step, max_rot_step)
                     T_base_eef_cur = T_base_eef_clamped
                     t_pred  = T_base_eef_pred[:3, 3]
                     t_clamp = T_base_eef_clamped[:3, 3]
+                    pos_clamped = t_clamp.copy()
+                    force_str = (f"  F_live=({F_live[0]:+.2f},{F_live[1]:+.2f},{F_live[2]:+.2f})N "
+                                f"|F_live|={np.linalg.norm(F_live):.1f}N")
+                    if predicts_force:
+                        force_str += (f"  f_desired=({f_desired[0]:.1f},{f_desired[1]:.1f},{f_desired[2]:.1f})N  "
+                                     f"corr={np.linalg.norm(correction)*100:.2f}cm")
                     print(f"  step {step} [{len(action_deque)} remain]: "
                           f"eef pred=({t_pred[0]*100:.1f},{t_pred[1]*100:.1f},{t_pred[2]*100:.1f}) cm "
-                          f"clamped=({t_clamp[0]*100:.1f},{t_clamp[1]*100:.1f},{t_clamp[2]*100:.1f}) cm")
+                          f"clamped=({t_clamp[0]*100:.1f},{t_clamp[1]*100:.1f},{t_clamp[2]*100:.1f}) cm"
+                          f"{force_str}")
                     if args.execute:
                         send_cartesian_pose(api, matrix_to_kinova_pose(T_base_eef_clamped),
                                             trans_speed=args.arm_trans_speed)
@@ -978,14 +1107,16 @@ def main():
                 else:
                     print(f"  step {step}: waiting for inference...")
 
-            # ── 6. Write state for 3D plotter (deploy_viz.py reads this) ────────
+            # ── 6. Write state for 3D plotter ─────────────────────────────────
             if not paused:
-                if latest_poses_base is not None:
+                if latest_actions_base is not None:
+                    latest_poses_base = [p for p, f in latest_actions_base]
                     poses_eef_pred  = np.stack([p.astype(np.float64) @ T_tool_eef
                                                  for p in latest_poses_base])
                     poses_tool_pred = np.stack([p.astype(np.float64)
                                                  for p in latest_poses_base])
                 else:
+                    latest_poses_base = None
                     poses_eef_pred  = np.zeros((0, 4, 4))
                     poses_tool_pred = np.zeros((0, 4, 4))
                 np.savez('/tmp/deploy_state_tmp.npz',
@@ -996,15 +1127,13 @@ def main():
                          poses_eef_pred=poses_eef_pred,
                          step=np.array([step]))
                 os.replace('/tmp/deploy_state_tmp.npz', '/tmp/deploy_state.npz')
+            else:
+                latest_poses_base = [p for p, f in latest_actions_base] if latest_actions_base else None
 
             # ── 7. Visualisation ─────────────────────────────────────────────
-            # T_base_tool is already in OBB frame; bbox corners are also in OBB frame.
-            # Project to camera using inv(T_base_task) to go base→task, then tf_world2cam task→cam.
-            # Apply inv_to_origin to match the mesh frame used by predicted-action axes
             ob_in_cam = tf_world2cam @ np.linalg.inv(T_base_task) @ T_base_tool @ inv_to_origin
             vis = rgb.copy()
             vis = draw_axes_simple(vis, ob_in_cam, K, scale=0.10)
-            center_pose = ob_in_cam
 
             if robot_mask.sum() > 0:
                 red = np.zeros_like(vis)
@@ -1014,7 +1143,6 @@ def main():
 
             if latest_poses_base is not None:
                 if action_frame == 'task':
-                    # policy output is already in task/world frame → directly to cam
                     cam_poses_pred = [tf_world2cam @ p.astype(np.float64) @ inv_to_origin
                                       for p in latest_poses_base]
                 else:
@@ -1035,25 +1163,13 @@ def main():
                         f"{'INFER' if _infer_running[0] else ''}  "
                         f"{'EXECUTE' if args.execute else 'DRY RUN'}  {_fps_disp:.1f} Hz",
                         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2)
-            cv2.putText(vis, f"proprio(task) xyz= {t_task[0]*100:.1f},{t_task[1]*100:.1f},{t_task[2]*100:.1f} cm"
-                            f"  train=[{-1.8:.1f}~{19.8:.1f}, {-32.2:.1f}~{-0.7:.1f}, {7.5:.1f}~{20.8:.1f}]",
+            cv2.putText(vis, f"proprio(task) xyz= {t_task[0]*100:.1f},{t_task[1]*100:.1f},{t_task[2]*100:.1f} cm",
                         (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-            if latest_poses_base is not None:
-                p0 = latest_poses_base[0]
-                cv2.putText(vis, f"pred[0](task) xyz= {p0[0,3]*100:.1f},{p0[1,3]*100:.1f},{p0[2,3]*100:.1f} cm",
-                            (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 0), 1)
-            # Console: print proprio vs pred every 10 steps for comparison
-            if step % 10 == 0:
-                from scipy.spatial.transform import Rotation as _R
-                r_task = _R.from_matrix(T_task_tool[:3,:3]).as_euler('xyz', degrees=True)
-                print(f"  [diag] proprio T_task_tool: xyz=({t_task[0]*100:.1f},{t_task[1]*100:.1f},{t_task[2]*100:.1f})cm  "
-                      f"euler=({r_task[0]:.1f},{r_task[1]:.1f},{r_task[2]:.1f})deg")
-                print(f"         train pos ranges: x[-1.8,19.8] y[-32.2,-0.7] z[7.5,20.8] cm")
-                if latest_poses_base is not None:
-                    p0 = latest_poses_base[0]
-                    r_pred = _R.from_matrix(p0[:3,:3]).as_euler('xyz', degrees=True)
-                    print(f"         pred[0] T_task_tool: xyz=({p0[0,3]*100:.1f},{p0[1,3]*100:.1f},{p0[2,3]*100:.1f})cm  "
-                          f"euler=({r_pred[0]:.1f},{r_pred[1]:.1f},{r_pred[2]:.1f})deg")
+            force_hud = f"F_live=({F_live[0]:+.1f},{F_live[1]:+.1f},{F_live[2]:+.1f})N  |F|={np.linalg.norm(F_live):.1f}N"
+            if predicts_force:
+                force_hud += (f"  corr={np.linalg.norm(correction)*100:.2f}cm  "
+                             f"{'ADMITTANCE ON' if args.admittance else 'admittance off'}")
+            cv2.putText(vis, force_hud, (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 255, 180), 1)
             if paused:
                 h, w = vis.shape[:2]
                 overlay = vis.copy()
@@ -1063,7 +1179,6 @@ def main():
                             (w//2 - 220, h//2 + 12),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 80, 255), 3)
 
-            # Policy view: dual-cam → show cam0 | cam1; single-cam → show full | crop
             pv_left  = cv2.resize(cv2.cvtColor(masked_rgb, cv2.COLOR_RGB2BGR), (424, 480))
             if masked_rgb_other is not None:
                 pv_right = cv2.resize(cv2.cvtColor(masked_rgb_other, cv2.COLOR_RGB2BGR), (424, 480))
@@ -1083,13 +1198,25 @@ def main():
                 cv2.imwrite(os.path.join(args.output_dir, f'{step:06d}.jpg'),
                             cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
 
-            # ── 8. Wait for arm convergence or sleep to maintain control frequency ──
+            # Single unified log point, every tick regardless of paused state --
+            # runs after any position-command update this tick, so pos_pred_raw/
+            # correction/pos_clamped reflect what actually just happened, not a
+            # stale value from an earlier tick (an earlier version of this
+            # logging appended t/F_live/q_deg much earlier in the loop body,
+            # before the position computation ran -- fine for force-only
+            # analysis, but would have been one tick out of sync with position).
+            log['t'].append(t_loop_start - t_run_start)
+            log['F_live'].append(F_live.copy())
+            log['q_deg'].append(q_deg.copy())
+            log['pos_cur_before'].append(pos_cur_before.copy())
+            log['pos_pred_raw'].append(pos_pred_raw.copy())
+            log['correction'].append(correction.copy())
+            log['pos_clamped'].append(pos_clamped.copy())
+
+            # ── 8. Wait for arm convergence or sleep ──────────────────────────
             if args.wait_convergence and cmd_xyz_base is not None and args.execute:
-                # Scale timeout with commanded move distance: allow ~arm_speed cm/s
-                # to actually reach the target, with a floor of convergence_timeout.
                 cmd_dist = np.linalg.norm(cmd_xyz_base - prev_cmd_xyz_base) \
                     if prev_cmd_xyz_base is not None else 0.0
-                # Use commanded speed if set, otherwise fall back to observed ~3 cm/s default
                 arm_speed = args.arm_trans_speed if args.arm_trans_speed > 0 else 0.03
                 adaptive_timeout = max(args.convergence_timeout,
                                        cmd_dist / arm_speed + 0.2)
@@ -1114,7 +1241,7 @@ def main():
                 if elapsed < dt:
                     time.sleep(dt - elapsed)
 
-            # ── 9. Step-mode gate: block until SPACE before next action ──────────
+            # ── 9. Step-mode gate ──────────────────────────────────────────────
             if args.step_mode and not paused and _action_sent:
                 _vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
                 h_v, w_v = _vis_bgr.shape[:2]
@@ -1159,6 +1286,19 @@ def main():
         api.CloseAPI()
         pipe.stop()
         cv2.destroyAllWindows()
+        if log['t']:
+            # Timestamped filename -- two runs against the same --output_dir
+            # (the default, if not overridden) previously silently overwrote
+            # each other's force_log.npz, losing the earlier run's data.
+            log_path = os.path.join(args.output_dir,
+                                    f'force_log_{time.strftime("%Y%m%d_%H%M%S")}.npz')
+            np.savez(log_path, t=np.array(log['t']), F_live=np.array(log['F_live']),
+                     q_deg=np.array(log['q_deg']),
+                     pos_cur_before=np.array(log['pos_cur_before']),
+                     pos_pred_raw=np.array(log['pos_pred_raw']),
+                     correction=np.array(log['correction']),
+                     pos_clamped=np.array(log['pos_clamped']))
+            print(f"Live force log saved -> {log_path}")
         print("Done.")
 
 

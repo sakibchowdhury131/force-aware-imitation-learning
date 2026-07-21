@@ -6,6 +6,27 @@ checkpoints/**
 data/**
 !data/.gitkeep
 
+# Segmentation model training data/checkpoints (weights exceed GitHub's 100MB
+# file limit anyway -- retrain locally or download separately)
+human_hand_segmentation_UNET/
+robot_segmentation_UNET/training/checkpoints/
+robot_segmentation_UNET/training/masks/
+robot_segmentation_UNET/training/results/
+
+# Deprecated/scratch scripts and one-off experiment output, not needed to run
+# the pipeline
+unnecessary/
+deploymentRuns/
+media/
+tool_trajectories_3d.html
+train_loss.png
+residual_repeatability.png
+
+# Large reference assets not needed to run the code
+JACO 6 DOF S_revA.STEP
+ScreenCamera_*.json
+ScreenCapture_*.png
+
 # Python cache
 __pycache__/
 *.py[cod]

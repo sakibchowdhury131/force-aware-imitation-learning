@@ -73,11 +73,25 @@ class MaxAbsNormalizer:
             self.scale  = (1.0 / max_abs).astype(np.float32)   # (action_dim,)
             self.offset = np.zeros_like(self.scale)
 
+    def _matched(self, n: int):
+        """Slice scale/offset to the last n dims if x is narrower than the
+        fitted normalizer -- e.g. a force-conditioned checkpoint's normalizer
+        is fit over 12D [pose9,force3], but a conditioning-only variant's
+        action target is pure 9D pose. Assumes x's dims are always a PREFIX
+        of the fitted dims (true here: force is always appended after pose,
+        never interleaved). No-op (returns the full arrays) when dims already
+        match, so every existing call site is unaffected."""
+        if n == self.scale.shape[-1]:
+            return self.scale, self.offset
+        return self.scale[:n], self.offset[:n]
+
     def normalize(self, x: np.ndarray) -> np.ndarray:
-        return x * self.scale + self.offset
+        scale, offset = self._matched(x.shape[-1])
+        return x * scale + offset
 
     def denormalize(self, x: np.ndarray) -> np.ndarray:
-        return (x - self.offset) / self.scale
+        scale, offset = self._matched(x.shape[-1])
+        return (x - offset) / scale
 
     def state_dict(self):
         return {'scale': self.scale, 'offset': self.offset}

@@ -47,19 +47,40 @@ def load_model(checkpoint_path, device):
     n_obs_steps    = ckpt.get('n_obs_steps',    2)
     n_views        = ckpt.get('n_views',        N_VIEWS)
     proprio_dim    = ckpt.get('proprio_dim',    PROPRIO_DIM)
+    action_dim     = ckpt.get('action_dim',     9)   # >9 for force-conditioned checkpoints (pose9+force3)
     action_horizon = ckpt['action_horizon']
-    unet_dims      = ckpt.get('unet_dims',      (256, 512, 1024))
-    unet_kernel    = ckpt.get('unet_kernel',    5)
-    model = DiffusionPolicyNet(
-        action_dim=9,
-        action_horizon=action_horizon,
-        n_obs_steps=n_obs_steps,
-        n_views=n_views,
-        proprio_dim=proprio_dim,
-        pretrained=False,
-        unet_dims=tuple(unet_dims),
-        unet_kernel=unet_kernel,
-    ).to(device)
+
+    # train_method absent -> 'ddpm'/'flow_matching' both reuse DiffusionPolicyNet
+    # (only the sampling procedure differs, see predict_action_sequence_flow).
+    # 'act' is a genuinely different architecture (act_common.ACTPolicy).
+    if ckpt.get('train_method') == 'act':
+        from act_common import ACTPolicy
+        model = ACTPolicy(
+            action_dim=action_dim,
+            proprio_dim=proprio_dim,
+            action_horizon=action_horizon,
+            n_obs_steps=n_obs_steps,
+            n_views=n_views,
+            hidden_dim=ckpt.get('hidden_dim', 256),
+            latent_dim=ckpt.get('latent_dim', 32),
+            n_heads=ckpt.get('n_heads', 8),
+            n_enc_layers=ckpt.get('n_enc_layers', 4),
+            n_dec_layers=ckpt.get('n_dec_layers', 7),
+            pretrained=False,
+        ).to(device)
+    else:
+        unet_dims   = ckpt.get('unet_dims',   (256, 512, 1024))
+        unet_kernel = ckpt.get('unet_kernel', 5)
+        model = DiffusionPolicyNet(
+            action_dim=action_dim,
+            action_horizon=action_horizon,
+            n_obs_steps=n_obs_steps,
+            n_views=n_views,
+            proprio_dim=proprio_dim,
+            pretrained=False,
+            unet_dims=tuple(unet_dims),
+            unet_kernel=unet_kernel,
+        ).to(device)
     model.load_state_dict(ckpt['model'])
     model.eval()
     normalizer = MaxAbsNormalizer.from_state_dict(ckpt['normalizer'])
@@ -104,7 +125,61 @@ def predict_action_sequence(model, normalizer, noise_scheduler, view_tensors, pr
 
     actions_norm = x[0].cpu().numpy().reshape(action_horizon, action_dim)
     actions      = normalizer.denormalize(actions_norm)
-    poses        = [action_9d_to_pose(a) for a in actions]
+    poses        = [action_9d_to_pose(a[:9]) for a in actions]   # a[:9] -- extra dims (e.g. force) ignored here
+    return actions, poses
+
+
+@torch.no_grad()
+def predict_action_sequence_flow(model, normalizer, view_tensors, proprio, device,
+                                 time_scale=999.0, ode_steps=50):
+    """
+    Flow-matching counterpart to predict_action_sequence — same model
+    (DiffusionPolicyNet reused as a velocity field, see 05_train_flow.py),
+    but samples by Euler-integrating dx/dt = v_theta(x_t, t*time_scale, obs)
+    from x0 ~ N(0,I) at t=0 to t=1, instead of DDPM reverse diffusion.
+
+    view_tensors / proprio: same shapes as predict_action_sequence.
+    Returns: actions (action_horizon, 9) denormalized, poses (list of 4x4).
+    """
+    action_dim     = model.action_dim
+    action_horizon = model.action_horizon
+    flat           = action_dim * action_horizon
+
+    obs_imgs  = torch.stack(view_tensors).unsqueeze(0).to(device)
+    proprio_t = torch.from_numpy(np.stack(proprio).astype(np.float32)).unsqueeze(0).to(device)
+    obs_emb   = model.encode_obs(obs_imgs, proprio_t)
+
+    x  = torch.randn(1, flat, device=device)
+    dt = 1.0 / ode_steps
+    for i in range(ode_steps):
+        t = torch.full((1,), i * dt, device=device)
+        v = model(x, t * time_scale, obs_emb)
+        x = x + v * dt
+
+    actions_norm = x[0].cpu().numpy().reshape(action_horizon, action_dim)
+    actions      = normalizer.denormalize(actions_norm)
+    poses        = [action_9d_to_pose(a[:9]) for a in actions]   # a[:9] -- extra dims (e.g. force) ignored here
+    return actions, poses
+
+
+@torch.no_grad()
+def predict_action_sequence_act(model, normalizer, view_tensors, proprio, device):
+    """
+    ACT counterpart to predict_action_sequence -- single transformer forward
+    pass predicts the whole action chunk directly (no iterative sampling).
+    actions=None at inference -> CVAE latent z is fixed to zero (see
+    act_common.ACTPolicy.forward), matching the original ACT eval convention.
+
+    view_tensors / proprio: same shapes as predict_action_sequence.
+    Returns: actions (action_horizon, 9) denormalized, poses (list of 4x4).
+    """
+    obs_imgs  = torch.stack(view_tensors).unsqueeze(0).to(device)
+    proprio_t = torch.from_numpy(np.stack(proprio).astype(np.float32)).unsqueeze(0).to(device)
+    pred_actions, _, _ = model(obs_imgs, proprio_t, actions=None)
+
+    actions_norm = pred_actions[0].cpu().numpy()
+    actions      = normalizer.denormalize(actions_norm)
+    poses        = [action_9d_to_pose(a[:9]) for a in actions]   # a[:9] -- extra dims (e.g. force) ignored here
     return actions, poses
 
 

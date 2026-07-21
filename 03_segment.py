@@ -149,8 +149,12 @@ def process_dir(src_dir, dst_dir, mask_fn, batch_size):
                         [cv2.IMWRITE_JPEG_QUALITY, 95])
 
 
-def process_episode(episode_dir, mask_fn, args):
-    """Mask real (and optionally novel) frames for one episode. Returns True if work was done."""
+def process_episode(episode_dir, mask_fn, args, mask_fn2=None):
+    """Mask real (and optionally novel) frames for one episode. Returns True if work was done.
+
+    mask_fn2, when given, is applied only to cameras in args.unet2_cams and its
+    mask is UNIONed with mask_fn's -- see mask_fn2 construction in main() for why
+    this isn't unioned unconditionally for every camera."""
     aug_dir   = os.path.join(episode_dir, 'augmented')
     real_dst  = os.path.join(aug_dir, 'masked_real')
     novel_dst = os.path.join(aug_dir, 'masked_novel')
@@ -175,14 +179,19 @@ def process_episode(episode_dir, mask_fn, args):
             cam_dir = os.path.join(episode_dir, f'cam{cam_i}')
             if not os.path.isdir(cam_dir):
                 continue
+            use_second = mask_fn2 is not None and cam_i in args.unet2_cams
             files = sorted(f for f in os.listdir(cam_dir) if f.endswith('.jpg'))
-            print(f"  cam{cam_i}: {len(files)} frames → masked_real/")
+            print(f"  cam{cam_i}: {len(files)} frames → masked_real/"
+                  f"{'  (+ robot-arm mask)' if use_second else ''}")
             for start in range(0, len(files), args.batch_size):
                 batch_files = files[start:start + args.batch_size]
                 images_rgb = [cv2.cvtColor(cv2.imread(os.path.join(cam_dir, fn)),
                                            cv2.COLOR_BGR2RGB)
                               for fn in batch_files]
                 masks = mask_fn(images_rgb)
+                if use_second:
+                    masks2 = mask_fn2(images_rgb)
+                    masks = [m | m2 for m, m2 in zip(masks, masks2)]
                 for fn, img_rgb, mask in zip(batch_files, images_rgb, masks):
                     fid = os.path.splitext(fn)[0]   # e.g. "000042"
                     out_name = f'{fid}_cam{cam_i}.jpg'
@@ -238,6 +247,19 @@ def parse_args():
                         'If provided, uses UNet instead of GroundedSAM2 — much faster.')
     p.add_argument('--unet_threshold', type=float, default=0.5,
                    help='Sigmoid threshold for UNet predictions (default: 0.5)')
+    p.add_argument('--unet_checkpoint2', default=None,
+                   help='Optional second UNet checkpoint, e.g. robot_segmentation_UNET '
+                        '(a segmentation_models_pytorch resnet34 Unet, different '
+                        'architecture from --unet_checkpoint\'s train_unet_seg.ResNetUNet). '
+                        'Its mask is UNIONed with --unet_checkpoint\'s mask before blacking '
+                        'out pixels -- use when a camera view shows two different things '
+                        'that both need masking (e.g. human hand AND a partially-visible '
+                        'robot arm). Only takes effect when --unet_checkpoint is also set.')
+    p.add_argument('--unet2_cams', type=int, nargs='+', default=[1],
+                   help='(--cam_only mode only) Camera indices to apply --unet_checkpoint2\'s '
+                        'mask to. Other cameras only get --unet_checkpoint\'s mask -- avoids '
+                        'false-positive blackouts on views that never show whatever the '
+                        'second UNet was trained to detect. Default: cam1 only.')
     return p.parse_args()
 
 
@@ -272,6 +294,21 @@ def main():
 
         thresh = args.unet_threshold
 
+        # Optional second UNet (different architecture -- segmentation_models_pytorch
+        # resnet34 Unet, e.g. robot_segmentation_UNET) whose mask is UNIONed with the
+        # first, for camera views that show two different things needing masking.
+        model2 = None
+        if args.unet_checkpoint2:
+            import segmentation_models_pytorch as smp
+            IMG_H2, IMG_W2 = 288, 512
+            MEAN2, STD2 = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+            print(f"Loading second UNet (smp resnet34) from {args.unet_checkpoint2} ...")
+            model2 = smp.Unet(encoder_name='resnet34', encoder_weights=None,
+                              in_channels=3, classes=1).to(device)
+            ckpt2 = torch.load(args.unet_checkpoint2, map_location=device)
+            model2.load_state_dict(ckpt2['model_state'])
+            model2.eval()
+
         def mask_fn(images_rgb):
             tensors = [TF.normalize(
                            TF.to_tensor(PILImage.fromarray(im).resize((IMG_W, IMG_H), PILImage.BILINEAR)),
@@ -294,11 +331,42 @@ def main():
                 masks.append(prob > thresh)
             return masks
 
-        print(f"  UNet mode  (threshold={thresh},  batch_size={args.batch_size})")
+        # Second mask function (robot arm) -- kept SEPARATE from mask_fn rather than
+        # unioned inside it, because it should only apply to specific camera views
+        # (--unet2_cams, e.g. cam1) where the robot is actually visible. Unioning
+        # unconditionally would risk false-positive blackouts on cameras (e.g. cam0)
+        # that never show the robot at all.
+        mask_fn2 = None
+        if model2 is not None:
+            def mask_fn2(images_rgb):
+                tensors2 = [TF.normalize(
+                                TF.to_tensor(PILImage.fromarray(im).resize((IMG_W2, IMG_H2), PILImage.BILINEAR)),
+                                MEAN2, STD2)
+                            for im in images_rgb]
+                batch2 = torch.stack(tensors2).to(device)
+                with torch.no_grad():
+                    if device.type == 'cuda':
+                        with torch.autocast(device_type='cuda', dtype=torch.float16):
+                            logits2 = model2(batch2)
+                    else:
+                        logits2 = model2(batch2)
+                masks2 = []
+                for logit2, im in zip(logits2, images_rgb):
+                    oh, ow = im.shape[:2]
+                    prob2 = F.interpolate(
+                        logit2.sigmoid().float().unsqueeze(0),
+                        size=(oh, ow), mode='bilinear', align_corners=False
+                    ).squeeze().cpu().numpy()
+                    masks2.append(prob2 > thresh)
+                return masks2
+
+        extra = f"  + second UNet (robot arm, cams {args.unet2_cams})" if model2 is not None else ""
+        print(f"  UNet mode  (threshold={thresh},  batch_size={args.batch_size}){extra}")
 
     else:
         print("Loading GroundingDINO + SAM2 (once for all episodes)...")
         gdino, sam2_predictor = load_models(args.device)
+        mask_fn2 = None
 
         def mask_fn(images_rgb):
             # Group by resolution (torch.stack requires identical sizes)
@@ -324,7 +392,7 @@ def main():
         print(f"\n{'='*60}")
         print(f"Episode {i+1}/{len(episode_dirs)}: {ep_name}")
         print('='*60)
-        ok = process_episode(episode_dir, mask_fn, args)
+        ok = process_episode(episode_dir, mask_fn, args, mask_fn2=mask_fn2)
         if ok:
             n_done += 1
         else:
