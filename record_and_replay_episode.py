@@ -77,6 +77,17 @@ def parse_args():
     p.add_argument('--mesh', required=True)
     p.add_argument('--tool_prompt', required=True)
     p.add_argument('--track_cam', type=int, default=1)
+    p.add_argument('--task_frame', default=None,
+                   help='Camera extrinsics for stage-1 tracking, passed through to 01_record.py. '
+                        'Defaults to 01_record.py\'s own default (data/cam{track_cam}_extrinsics.npy) '
+                        'when omitted -- pass this explicitly if this rig/task uses different camera '
+                        'calibration files (e.g. a different physical camera position per task).')
+    p.add_argument('--box_threshold', type=float, default=None,
+                   help='GroundingDINO box threshold, passed through to 01_record.py. Defaults to '
+                        '01_record.py\'s own default (0.3) when omitted.')
+    p.add_argument('--text_threshold', type=float, default=None,
+                   help='GroundingDINO text threshold, passed through to 01_record.py. Defaults to '
+                        '01_record.py\'s own default (0.25) when omitted.')
     p.add_argument('--robot_extrinsics', default='data/robot_extrinsics_stick_corrected_zmeasured.npy')
     p.add_argument('--T_eef_spoon', default='data/T_eef_spoon.npy')
     p.add_argument('--subsample', type=int, default=3)
@@ -119,7 +130,10 @@ def main():
             '--auto_track',
             '--auto_track_refine_iter', str(args.auto_track_refine_iter),
             '--auto_track_est_refine_iter', str(args.auto_track_est_refine_iter),
-        ] + (['--skip_auto_visualize'] if args.skip_visualize else []))
+        ] + (['--skip_auto_visualize'] if args.skip_visualize else [])
+          + (['--task_frame', args.task_frame] if args.task_frame else [])
+          + (['--box_threshold', str(args.box_threshold)] if args.box_threshold is not None else [])
+          + (['--text_threshold', str(args.text_threshold)] if args.text_threshold is not None else []))
     else:
         episode = args.episode
 

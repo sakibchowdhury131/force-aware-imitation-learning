@@ -4,6 +4,52 @@
 
 A modular re-implementation of the Tool-as-Interface imitation learning pipeline. Provide any tool as a 3D mesh and a text prompt — no code changes required.
 
+**🌐 Project page (force-conditioned extension): [sakibchowdhury131.github.io/projects/force-conditioned-imitation-learning](https://sakibchowdhury131.github.io/projects/force-conditioned-imitation-learning/)** — paper, full narrated demo, and additional results.
+
+---
+
+## Demo
+
+This repo's force-conditioning work recovers time-varying contact force from vision-only human demonstrations by replaying the tracked trajectory on the robot and reading it back off the joint-torque sensors, then trains a policy that predicts both reference pose *and* wrench for contact-rich manipulation.
+
+<table>
+<tr>
+<td align="center" width="50%">
+<a href="https://sakibchowdhury131.github.io/projects/force-conditioned-imitation-learning/web/force-conditioned-visuomotor-policy.mp4">
+<img src="media/fcil_force-conditioned-visuomotor-policy-poster.jpg" width="100%"><br>
+▶ Narrated walkthrough (full pipeline)
+</a>
+</td>
+<td align="center" width="50%">
+<a href="https://sakibchowdhury131.github.io/projects/force-conditioned-imitation-learning/web/novel-views.mp4">
+<img src="media/fcil_novel-views-poster.jpg" width="100%"><br>
+▶ Novel-view synthesis (NoPoSplat)
+</a>
+</td>
+</tr>
+<tr>
+<td align="center" width="50%">
+<a href="https://sakibchowdhury131.github.io/projects/force-conditioned-imitation-learning/web/force-conditioned.mp4">
+<img src="media/fcil_force-conditioned-poster.jpg" width="100%"><br>
+▶ Deployment — pose + force policy
+</a>
+</td>
+<td align="center" width="50%">
+<a href="https://sakibchowdhury131.github.io/projects/force-conditioned-imitation-learning/web/without-force.mp4">
+<img src="media/fcil_without-force-poster.jpg" width="100%"><br>
+▶ Deployment — pose-only baseline
+</a>
+</td>
+</tr>
+</table>
+
+| | |
+|---|---|
+| ![Human demonstration and robot replay-to-sense pipeline, with NoPoSplat novel-view generation and external wrench sensing feeding the policy](media/fcil_system-diagram.png) | ![Diffusion policy architecture: ResNet-18 encoder, FiLM conditioning, 1D U-Net denoiser](media/fcil_network_architecture.png) |
+| *System overview: human demo tracking → robot replay-to-sense (wrench recovery) → novel-view augmentation → force-conditioned policy* | *Pose+force diffusion policy: ResNet-18 encoder, FiLM-conditioned 1D U-Net denoiser* |
+| ![Coordinate frame relationships between camera, tool, task, end-effector, and robot base](media/fcil_coordinate-systems.png) | ![Comparison of feed-forward novel-view synthesis methods: MASt3R, Splatt3R, NoPoSplat](media/fcil_novel-views-comparison.png) |
+| *Coordinate frames: camera ↔ tool ↔ task ↔ end-effector ↔ robot base* | *Novel-view synthesis comparison: MASt3R, Splatt3R, NoPoSplat* |
+
 ---
 
 ## Physical setup

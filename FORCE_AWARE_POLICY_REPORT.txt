@@ -1,0 +1,1186 @@
+================================================================================
+FORCE-AWARE IMITATION LEARNING ON A KINOVA JACO2: GRAVITY/DYNAMICS
+CALIBRATION, ACTION-REPLAY FORCE SENSING, FORCE-CONDITIONED POLICIES, AND
+ADMITTANCE-CONTROL DEPLOYMENT -- COMPREHENSIVE REPORT
+================================================================================
+
+Task: PastaTransfer_force (pasta-scooping-and-transfer), Kinova Jaco2 6-DOF
+arm, spoon end-effector. Compiled from FORCE_SENSING_FINDINGS.md,
+POLICY_EXPERIMENTS.md, FORCE_SENSING_SCRIPTS_README.md, and the source code
+of contact_detector.py / 05_train_replay_force.py / 07_deploy_force.py /
+analyze_replay_full.py in the tool-as-interface pipeline
+(/home/sakib/working_dir/tool-as-interface/pipeline).
+
+Related interactive artifacts (charts):
+  - Gravity calibration report:
+    https://claude.ai/code/artifact/aa299a1c-9d7e-4a37-95e7-26a097f2da03
+  - Mass/Coriolis regressor-vs-NN report:
+    https://claude.ai/code/artifact/8d729f0b-ba1e-46bc-9753-a3585a2079e3
+
+
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+ 1. Problem statement and overall architecture
+ 2. Gravity estimation
+    2.1 Firmware gravity matrix
+    2.2 Software linear gravity regressor -- mathematical model
+    2.3 Software linear gravity regressor -- random poses vs. task poses
+    2.4 Gravity-residual neural network
+ 3. Mass/Coriolis (rigid-body dynamics) residual estimation
+    3.1 Why the naive per-link parametrization fails -- the bilinearity problem
+    3.2 The barycentric reparametrization -- exact linear regressor
+    3.3 First attempt: a confounded neural-network comparison
+    3.4 The fix: cleaning the target, constraining the network
+    3.5 Regressor vs. constrained NN -- final results at scale
+    3.6 Bottom line on gravity/dynamics modeling
+ 4. End-effector external force estimation via action replay
+    4.1 Why replay, not the human demonstration, is the source of force data
+    4.2 The full three-tier force-recovery pipeline (equations)
+    4.3 From dense replay logs to per-frame training labels
+    4.4 Live force estimation at deployment time
+    4.5 A real pipeline bug: live force vs. training-label force mismatch
+ 5. Force-conditioned policy architectures and training
+    5.1 Combined variant (force is both observed and predicted)
+    5.2 Conditioning-only variant (force observed, never predicted)
+    5.3 Offline force-prediction accuracy and the episode drift investigation
+ 6. Admittance control: theory and implementation
+    6.1 Connection to Modern Robotics Ch. 11 (force/impedance control)
+    6.2 The implemented control law
+    6.3 A saturation bug found and fixed
+    6.4 Known gap: stiffness-only, missing damping/inertia terms
+ 7. Experimental results: position control vs. admittance control
+    7.1 Primary result -- full-pasta, 7-trial controlled comparison
+    7.2 Effect of execution horizon (exec_steps 8 vs. 16)
+    7.3 Varying pasta fill level -- sparse / 50% / full
+    7.4 Confirmatory 50%-pasta retest
+    7.5 Session-drift as a confound
+    7.6 Force-vs-position contribution decomposition
+ 8. Summary of open items / future work
+ 9. Key file and script index
+================================================================================
+
+
+1. PROBLEM STATEMENT AND OVERALL ARCHITECTURE
+--------------------------------------------------------------------------------
+
+The Kinova Jaco2 has no dedicated force/torque sensor at the wrist or
+end-effector. The only signal available is joint torque, read via the SDK
+(raw torque and firmware "gravity-free" torque). The full joint-torque
+balance for an n-DOF manipulator is:
+
+    tau = M(q) qddot + C(q, qdot) qdot + G(q) + tau_friction + J^T(q) F_tip     (1)
+
+where:
+  tau           -- measured joint torque (6,)
+  M(q)          -- joint-space mass/inertia matrix
+  C(q, qdot)    -- Coriolis/centripetal matrix
+  G(q)          -- gravity torque
+  tau_friction  -- joint friction (viscous + Coulomb)
+  J(q)          -- geometric Jacobian (6x6, EEF frame)
+  F_tip         -- external wrench at the end-effector (the signal of interest)
+
+Recovering F_tip requires modeling and subtracting every other term. This
+project builds that model in layers, each calibrated independently and
+verified before being composed with the next:
+
+    raw torque (GetAngularForce)
+      -> GetAngularForceGravityFree                     [firmware gravity matrix]
+      -> - Y_g(q) @ phi                                 [software gravity regressor]
+      -> - G_res(q)                                     [gravity residual NN]
+      -> - Y_full(q,qdot,qddot) @ pi                     [mass/Coriolis regressor]
+      -> tau_ext  ->  torque_to_wrench()  ->  F_ext       (the quantity used everywhere downstream)
+
+Once F_ext can be estimated accurately and quickly (10 Hz is the deployment
+loop rate), the pipeline is used two ways:
+  (a) OFFLINE, to build per-frame force labels for imitation-learning
+      training data, by re-executing recorded human demonstrations on the
+      robot itself ("action replay") and reading joint torque while it moves
+      (Section 4);
+  (b) ONLINE, during deployment, to feed a live force reading into a
+      force-conditioned policy's observation, and to close an admittance
+      control loop around the policy's predicted force (Sections 5-7).
+
+The core hardware constraint that shapes the whole design: direct
+joint-torque control on this Jaco2 was found unreliable earlier in the
+project (the SDK API reports success but the arm does not actually move
+under torque commands, and it has needed a power cycle to recover). All
+control in this project therefore stays in **Cartesian position control**;
+"force control" here means *using a force estimate to modulate a position
+command*, i.e. admittance control (Section 6), not direct torque control.
+
+
+2. GRAVITY ESTIMATION
+--------------------------------------------------------------------------------
+
+Gravity is calibrated in two independent layers stacked on top of each
+other: a firmware-level fit (Kinova's own routine) and a software-level
+correction on top of that (first linear, then a residual neural network on
+top of the linear fit).
+
+2.1 Firmware gravity matrix (calibrate_firmware_gravity.py)
+    ----------------------------------------------------------------------
+    Uses Kinova's own `RunGravityZEstimationSequence` + `SetGravityOptimalZParam`
+    SDK routines -- an autonomous calibration sequence that moves the arm
+    through a set of poses and fits the firmware's internal gravity model.
+
+    - First attempt: 93.8% reduction in residual force, but the fitted
+      parameters destabilized actuator J6 (hardware fault, joystick red
+      lights, one-direction-only rotation until a power cycle). Suspected
+      root cause: uncalibrated torque sensors at the hardware level, an
+      undocumented precondition of this SDK routine. Result discarded, not
+      reused.
+    - Second attempt (clean, currently in use): mean ||F|| 21.41N -> 1.69N
+      (92.1% reduction) across 8 calibration poses, confirmed fault-free.
+        - Held-out check (6 new poses, same region): 1.81-1.87N residual --
+          generalizes well near its own calibration poses.
+        - Out-of-region check (pose with J2=111.7 deg, calibration spanned
+          ~183-223 deg): degraded to 6.51N -- a real generalization gap
+          outside the calibrated joint-angle region.
+    - Persistence: firmware gravity parameters do NOT survive a power cycle
+      (confirmed twice). `apply_saved_gravity_params()` must be called once
+      per session; this is wired automatically into the startup of 8
+      scripts (diag_contact.py, calibrate_contact_baseline.py,
+      diag_joint_torques.py, replay_episode.py, 07_deploy.py,
+      teach_by_hand.py, quick_pose_check.py, test_residual_repeatability.py).
+
+2.2 Software linear gravity regressor -- mathematical model
+    ----------------------------------------------------------------------
+    Even after the firmware fit, a smooth, pose-dependent residual (~1-2.5N
+    mapped to the EEF) survives in free space with no contact -- the
+    firmware's internal link mass/COM parameters don't perfectly match the
+    physical arm. This residual is itself a gravity torque, and gravity
+    torque is exactly LINEAR in a per-link parameter set (m, m*cx, m*cy,
+    m*cz):
+
+        tau_residual(q) = Y_g(q) @ phi                                      (2)
+
+    phi packs, per link, [m, m*cx, m*cy, m*cz] (4 parameters/link x 6 links
+    = 24 total) -- these are best-fit *corrections*, not the arm's true
+    inertial parameters (static gravity data alone can't identify all of
+    them; the fit is ridge-regularized).
+
+    Y_g(q) (the "gravity regressor") is derived analytically, not learned.
+    For link i (outboard of joint j, i.e. i >= j), gravity torque at joint j
+    is the sum over such links of the moment of that link's gravitational
+    force about joint j's axis:
+
+        Y_g[j, 4i]      = z_j . ( (p_i - o_j) x a0 )            (mass column)
+        Y_g[j, 4i+1:4i+4] = -z_j^T . skew(a0) . R_i               (m*c columns)
+
+    where a0 = -G_BASE is the fictitious base acceleration representing
+    gravity, z_j/o_j are joint j's axis/origin, p_i is link i's origin, and
+    R_i is link i's orientation -- all from the same forward-kinematics
+    chain (`fk_link_frames`) used everywhere else in the pipeline.
+    G_BASE = [0, 0, -9.81] (base +Z is "up" for this upright-mounted arm;
+    confirmed empirically, not just by internal self-consistency).
+
+    Full model at this stage, in subtraction order:
+
+        tau_gf = Y_g(q) @ phi + [M(q)qddot + C(q,qdot)qdot] + tau_ext        (3)
+
+    (the middle term is near-zero in the quasi-static regime used for clean
+    force reads, and is itself modeled separately in Section 3).
+
+2.3 Software linear gravity regressor -- random poses vs. task poses
+    ----------------------------------------------------------------------
+    (a) Random poses (calibrate_gravity_residual.py): phi fit by ridge
+        regression from poses generated by perturbing around known-safe
+        anchor configurations, unrelated to any specific task.
+          - 24 poses over 3 accumulating batches: mean ||F|| 6.08N -> 5.32N
+            (12.5% reduction), but inconsistent -- 6 of 24 poses got WORSE
+            (up to -63%), and the reduction DECLINED with more data across
+            batches (27.4% -> 20.9% -> 12.5%).
+
+    (b) Task poses (collect_task_poses.py): same linear regressor, but
+        poses taken directly from real pastaTransfer4 episode trajectories
+        (the actual poses the deployed policy visits).
+          - Mixed test (24 random + 9 task poses, evaluated on the 9 task
+            poses): 5.94N -> 3.34N (43.7% reduction), all 9 improved (37-51%
+            each), no outliers.
+          - Task-only training (40 poses from 8 episodes, no random poses):
+            6.56N -> 1.43N (78.2% reduction), stable across all 4
+            accumulating batches (79.7% -> 78.2%), every pose improved, no
+            decline with more data.
+          - Held-out validation (15 poses from 5 entirely different
+            episodes, never used in training): 5.99N -> 1.51N (74.8%
+            reduction), all 15 improved (59-89% each), landing at the
+            expected ~1-2N noise floor.
+
+    CONCLUSION: calibrating on real task poses is dramatically better and
+    more consistent than generic randomized poses -- the improvement is
+    concentrated specifically in the region the poses cover (confirmed: the
+    combined random+task fit, re-evaluated on the original 24 random poses,
+    still only reached ~15.7% reduction there).
+
+    Trusted artifact: data/gravity_phi_task_only.npy (fit) +
+    data/gravity_calibration_records_task_only.npz (the 40 training poses).
+
+2.4 Gravity-residual neural network (fit_gravity_residual_nn.py)
+    ----------------------------------------------------------------------
+    A small NN, G_res(q) -- input sin(q), cos(q) ONLY (pose, never velocity
+    or acceleration) -- fit ON TOP OF the trusted linear fit
+    (gravity_phi_task_only.npy), using exclusively static/near-zero-velocity
+    data (so it can never be confused with, or contaminate, the separate
+    mass/Coriolis residual work in Section 3).
+
+    Architecture: nn.Sequential(Linear(12, hidden), ReLU, Linear(hidden,
+    hidden), ReLU, Linear(hidden, 6)) i.e. sin/cos(q) (12-dim) -> hidden ->
+    hidden -> 6 joint-torque corrections. Trained on 40 dedicated
+    calibration poses plus near-static stretches mined from already-
+    collected motion episodes (extract_static_stretches, no new hardware
+    time needed).
+
+    - Re-fitting the LINEAR model with more poses barely helped (near-static
+      residual only dropped 0.81 -> 0.77 N*m) -- the fixed 24-parameter
+      linear functional form, not lack of data, was the bottleneck.
+    - The nonlinear NN did far better:
+        - 65 static samples (40 dedicated + near-static motion stretches):
+          1.53N -> 0.49N (68.2% train), 1.93N -> 1.13N (41.3% held-out, 18
+          samples from 3 untouched episodes).
+        - Scaled to 190 static samples (30 episodes): 1.50N -> 0.55N (63.0%
+          train), 1.93N -> 1.36N (29.3% held-out -- dip likely small-sample
+          noise at n=18, not a concern).
+
+    CONCLUSION: for gravity, a nonlinear pose-only correction recovers far
+    more of the residual than the linear model can, regardless of how much
+    data the linear model gets -- a genuine, uncontested win for the NN.
+    True residual here (kinematic/sensor calibration error) has no reason
+    to be linear in anything.
+
+    Trusted artifact: data/gravity_residual_nn.pt
+
+
+3. MASS/CORIOLIS (RIGID-BODY DYNAMICS) RESIDUAL ESTIMATION
+--------------------------------------------------------------------------------
+
+3.1 Why the naive per-link parametrization fails -- the bilinearity problem
+    ----------------------------------------------------------------------
+    contact_detector.py's original `rnea_no_gravity` parametrizes each link
+    by (mass, COM) SEPARATELY. That makes M(q)qddot + C(q,qdot)qdot
+    BILINEAR, not linear, in those parameters (mass multiplies a term that
+    already depends on COM) -- it cannot be turned into a regressor by
+    simply overriding those three quantities independently, the way
+    gravity_regressor could.
+
+3.2 The barycentric reparametrization -- exact linear regressor
+    ----------------------------------------------------------------------
+    Standard fix (Khalil & Dombre; Featherstone's spatial-inertia
+    formulation; the same trick gravity_regressor already used, extended):
+    reparametrize each link i by the barycentric triple:
+
+        mass_i                      (1 parameter)
+        h_i = mass_i * com_i        (3 parameters, "first moment" -- same
+                                      quantity gravity_regressor's m*c columns use)
+        J_i = inertia about the link's OWN REFERENCE-FRAME ORIGIN, not COM
+                                     (6 independent parameters, symmetric tensor)
+
+    Because the kinematic quantities (a_i, omega_i, alpha_i) never depend on
+    the CURRENT link's own dynamic parameters (only on upstream motion and
+    pure geometry), the force/moment equations become linear and DECOUPLED
+    in (mass_i, h_i, J_i):
+
+        f_i = mass_i * a_i + alpha_i x h_i + omega_i x (omega_i x h_i)       (4)
+        n_i = J_i . alpha_i + omega_i x (J_i . omega_i) + h_i x a_i          (5)
+
+    (moments taken about the link's reference-frame origin directly, not
+    COM -- hence the extra h_i x a_i term that the COM-based rnea_no_gravity
+    does not have).
+
+    This makes the whole equation EXACTLY LINEAR in 10 parameters/link (60
+    total) plus a viscous+Coulomb friction term (2 parameters/joint, 12
+    total) -- 72 parameters overall:
+
+        M(q) qddot + C(q,qdot) qdot [+ friction] = Y_full(q,qdot,qddot) @ pi   (6)
+
+    pi packs, per link: [mass, hx, hy, hz, Jxx, Jyy, Jzz, Jxy, Jxz, Jyz],
+    plus [viscous_j, coulomb_j] per joint appended at the end. Y_full is
+    built by UNIT PERTURBATION of the reparametrized RNEA (`rnea_full`):
+    since rnea_full is exactly linear in each parameter by construction,
+    evaluating it with one parameter set to 1 and all others to 0 gives
+    EXACTLY that parameter's regressor column (not a finite-difference
+    approximation -- linear functions have exact, step-size-independent
+    "derivatives" this way). Friction columns:
+
+        Y_full[i, viscous_col]  = qdot_i                          (viscous)
+        Y_full[i, coulomb_col]  = sign(qdot_i)  (0 if |qdot_i| < 1e-6)   (Coulomb)
+
+    Verification performed before fitting anything (self-test in
+    contact_detector.py's __main__):
+      - rnea_full at the nominal (converted) link parameters reproduces
+        rnea_no_gravity's original output to ~1e-16.
+      - full_dynamics_regressor's first 4 columns per link, evaluated at
+        qdot=qddot=0 with the gravity-equivalent base acceleration, reduce
+        to gravity_regressor exactly.
+      - M(q), built column-by-column via unit qddot with qdot=0, is
+        symmetric and positive-definite (a necessary property of any valid
+        rigid-body inertia matrix).
+      - tau is exactly zero at qdot=qddot=0 for any q.
+    Later optimized (~1.9x speedup: forward kinematics computed once per
+    sample and reused across the 72 unit-perturbation calls, instead of
+    recomputed 72 times) with no change to any result (re-verified to the
+    same precision).
+
+3.3 First attempt: a confounded neural-network comparison
+    ----------------------------------------------------------------------
+    Excitation data (real q_dot/q_ddot needed, unlike the deliberately slow
+    quasi-static replays used for clean contact-force reading elsewhere):
+    `replay_episode.py --no_wait_convergence --speed_scale 0.5
+    --arm_trans_speed 0.08`, 6 training + 3 held-out pastaTransfer4 episodes.
+
+    Target: gravity-free torque - gravity_regressor(q)@phi -
+    rnea_no_gravity(q,qdot,qddot).
+
+        Method                         Train reduction   Held-out reduction
+        ----------------------------   ----------------   -------------------
+        Linear regressor (72 params)         4.2%               3.6%
+        Neural network (unconstrained)      39.0%              34.1%
+
+    The NN looked like a huge win. IT WASN'T. A direct check -- feeding the
+    NN real held-out poses with qdot=qddot=0 substituted, where a genuine
+    M(q)qddot+C(q,qdot)qdot effect is mathematically required to be exactly
+    zero -- showed the NN still output ~1.48N, almost as large as its
+    entire real-world correction. Confirmed independently: near-static
+    samples (|qdot|<5 deg/s) carried nearly as much residual (0.81 N*m) as
+    fast samples (1.10 N*m), meaning most of the "residual" wasn't
+    dynamics-dependent at all.
+
+    ROOT CAUSE: the NN's input included q directly with no constraint
+    forcing zero output at rest, so it was quietly patching leftover
+    pose-dependent GRAVITY error (Section 2) that the regressor is
+    mathematically incapable of touching (Y_full(q,qdot,qddot) is exactly
+    zero whenever qdot=qddot=0, by construction). Not a fair comparison.
+
+3.4 The fix: cleaning the target, constraining the network
+    ----------------------------------------------------------------------
+    Two parts, both required:
+      1. DATA FIX: subtract the gravity-residual NN's correction (Section
+         2.4) from the target BEFORE either dynamics model sees it, so
+         neither model is asked to explain pose-only leftover error as if
+         it were dynamics.
+      2. ARCHITECTURE FIX: rebuilt the NN as two physically-shaped heads
+         instead of one monolithic network (`ConstrainedResidualNet` in
+         fit_dynamics_nn_constrained.py):
+
+             M_res(q)      -- input sin(q),cos(q) only -- outputs a
+                               symmetric 6x6 matrix
+             C_res(q,qdot) -- input sin(q),cos(q),qdot -- outputs a
+                               general 6x6 matrix
+
+             tau_residual = M_res(q) @ qddot + C_res(q, qdot) @ qdot         (7)
+
+         Both outputs are multiplied by qddot/qdot respectively, so the
+         combined prediction is EXACTLY ZERO whenever qdot=qddot=0, for ANY
+         network weights -- the same hard constraint the regressor already
+         had, enforced by the multiplication itself, not by training.
+         Verified directly: max|prediction| = 0.00e+00 at synthetic rest
+         points.
+
+3.5 Regressor vs. constrained NN -- final results at scale
+    ----------------------------------------------------------------------
+    Corrected comparison, 6 training episodes:
+
+        Method              Train reduction   Held-out reduction
+        -----------------   ----------------   -------------------
+        Regressor                 5.0%               4.7%
+        Constrained NN            16.3%              6.8%
+
+    (Baseline itself, before either dynamics model does anything, dropped
+    from 2.11/2.22N to 1.61/1.71N train/held-out just from the gravity fix
+    -- ~24%.) The constrained NN still edged out the regressor on held-out
+    data, but its train-to-held-out drop (16.3% -> 6.8%, more than half)
+    signaled it was partly memorizing the 6 specific training episodes.
+
+    Scaled up to 30 training episodes (every pastaTransfer4 episode with
+    tracked data except the 3 held-out ones, which stayed completely
+    untouched throughout). Gravity-residual NN refit on 190 static samples
+    (up from 65). Dynamics target and both models rebuilt from scratch
+    (37,671 training samples, up from 7,514):
+
+        Method            Train (6ep)  Held-out (6ep)  Train (30ep)  Held-out (30ep)
+        ---------------   -----------  --------------  ------------  ---------------
+        Regressor            5.0%          4.7%             4.9%          5.2%
+        Constrained NN       16.3%         6.8%             9.1%          5.3%
+
+    With 5x more training data, the NN's train-set number FELL (16.3% ->
+    9.1%, it can no longer memorize 6 episodes as easily) while its
+    held-out number barely moved (6.8% -> 5.3%). The train/held-out gap
+    shrank from 9.5 points to 3.8. REGRESSOR AND NN ARE NOW WITHIN NOISE OF
+    EACH OTHER ON HELD-OUT DATA (5.2% vs 5.3% -- matching to 3 decimal
+    places in mean and std of the raw evaluation).
+
+    This convergence is the real finding: the true recoverable
+    mass/Coriolis effect in this workspace is small (~5%), and both a
+    72-parameter linear model and a flexible constrained NN land on the
+    same number once given enough data to stop overfitting. The NN's
+    earlier apparent 34-39% advantage was almost entirely a
+    data-scarcity/confound artifact, not a genuine capability gap.
+
+3.6 Bottom line on gravity/dynamics modeling
+    ----------------------------------------------------------------------
+    - GRAVITY RESIDUAL: use the NN (fit_gravity_residual_nn.py). Real,
+      substantial, uncontested improvement (63-68% train, 29-41% held-out)
+      over the linear model -- the true residual there (kinematic/sensor
+      calibration error) has no reason to be linear in anything.
+    - MASS/CORIOLIS RESIDUAL: use the REGRESSOR
+      (fit_dynamics_regressor.py / full_dynamics_regressor). Statistically
+      tied with the NN in achievable accuracy (~5% either way), but far
+      simpler, numerically stable across every configuration tried, fully
+      inspectable, and mathematically guaranteed to never predict an
+      unphysical result -- because M(q)qddot+C(q,qdot)qdot is EXACTLY the
+      linear structure the regressor already encodes; there is little
+      nonlinear-in-q structure left for a network to find.
+    - LAYERING THAT WORKS, END TO END: firmware gravity matrix -> software
+      gravity regressor (gravity_phi_task_only.npy) -> gravity residual NN
+      (gravity_residual_nn.pt) -> nominal RNEA (rnea_no_gravity) ->
+      mass/Coriolis regressor (dynamics_residual_pi.npy) -> remainder is
+      tau_ext, mapped to an end-effector wrench via torque_to_wrench.
+
+    Sanity-check numbers (no contact): the final-estimate tier should read
+    ~1-3N, occasionally briefly higher during fast motion -- this is the
+    established sensor/model noise floor for this arm, not a defect. A real
+    applied push looks like a clean ramp from that floor up to however hard
+    you push (30N+ seen for a firm push in testing) and back down over
+    roughly half a second -- sharp isolated single-sample spikes with no
+    ramp are more likely noise than real contact.
+
+
+4. END-EFFECTOR EXTERNAL FORCE ESTIMATION VIA ACTION REPLAY
+--------------------------------------------------------------------------------
+
+4.1 Why replay, not the human demonstration, is the source of force data
+    ----------------------------------------------------------------------
+    The human hand holding the spoon during demonstration recording carries
+    NO force sensor -- there is no way to measure contact force during a
+    bare-hand demo. The only way to harvest force data for this task is to
+    have the ROBOT itself re-execute ("replay") the tracked human
+    trajectory and read its own joint-torque sensors while doing so
+    (`replay_episode.py`). This is why the training data source for every
+    force-conditioned model in this project is REPLAY images/torque, not
+    the original human-demonstration images -- pose labels are shared
+    between both (replay re-executes the exact tracked trajectory, so a
+    given frame_id's tool_poses_base.npz pose label is correct for both),
+    but force only exists on the replay side.
+
+    Two replay motion modes exist:
+      - Quasi-static (default): stops and settles at each of ~100-150
+        waypoints (~70s total) -- deliberately slow, for clean contact-force
+        readings, at the cost of looking jittery/stop-start.
+      - Continuous (`--no_wait_convergence --speed_scale 0.5
+        --arm_trans_speed 0.08`): smooth motion (~20-25s total), needed to
+        generate real qdot/qddot for exciting the dynamics models
+        (Section 3), at the cost of more real inertial noise in the force
+        reading.
+
+4.2 The full three-tier force-recovery pipeline (equations)
+    ----------------------------------------------------------------------
+    Implemented identically in three places: diag_replay_forces.py (live,
+    during a replay), analyze_replay_full.py (post-hoc, from a saved log --
+    this is what actually produces every training label used in this
+    project), and 07_deploy_force.py (live, during deployment, once the bug
+    in Section 4.5 was fixed). Per timestep i:
+
+        F_fw          = torque_to_wrench(q_i, gf_i)                                    (tier 1: firmware-only)
+
+        g_res_lin     = gravity_regressor(q_i) @ phi
+        g_res_nn      = GravityResidualNet(q_i)
+        tau_after_g   = gf_i - g_res_lin - g_res_nn
+        F_grav        = torque_to_wrench(q_i, tau_after_g)                              (tier 2: + gravity, regressor+NN)
+
+        qddot_i       = VelocityDifferentiator.update(qdot_i, t_i)   [smoothed finite difference]
+        dyn_pred      = full_dynamics_regressor(q_i, qdot_i, qddot_i) @ pi
+        tau_final     = tau_after_g - dyn_pred
+        F_final       = torque_to_wrench(q_i, tau_final)                                (tier 3: + mass/Coriolis, FINAL ESTIMATE)
+
+    where gf_i is the firmware's GetAngularForceGravityFree reading. F_final
+    is "the number that matters" -- the pure external wrench at the EEF,
+    base frame -- used for every downstream force label and live reading in
+    this project.
+
+    torque_to_wrench maps joint torque to an EEF wrench via the Jacobian
+    transpose:
+
+        tau = J^T(q) F   =>   F = pinv(J^T(q)) tau                                      (8)
+
+    Near a kinematic singularity, cond(J) blows up and plain pinv(J^T)
+    amplifies torque noise without bound (confirmed on hardware: a J5=180
+    deg spherical-wrist singularity turned a real ~1 N*m torque error into
+    a reported multi-million-Newton "force"). Two safeguards:
+      - damping > 0 uses damped least squares instead of pinv -- the
+        Tikhonov-regularized solution to
+        min ||J^T F - tau||^2 + damping^2 ||F||^2, i.e.
+        F = (J J^T + damping^2 I)^-1 J tau. (damping=0 recovers plain-pinv
+        behavior exactly, so existing callers were unaffected when this was
+        added.)
+      - A warning prints whenever cond(J) exceeds a threshold (1e4 default),
+        regardless of damping.
+
+4.3 From dense replay logs to per-frame training labels
+    ----------------------------------------------------------------------
+    Force preprocessing, per episode (05_train_replay_force.py):
+      1. Load the DENSE replay force log (~47 Hz, replay/replay_full_forces.npz)
+         -- NOT the already-sparse per-waypoint log
+         (replay_forces_per_frame.npz, ~150 samples over ~60s, ~2.5Hz
+         average, right at the Nyquist edge for a 2Hz filter and too coarse
+         to filter meaningfully).
+      2. TARE: subtract the mean force over the first `--tare_window_s`
+         seconds. Pose-dependent gravity-residual bias varies episode-to-
+         episode by several Newtons even at rest (confirmed empirically
+         across episodes 020/021/025/030/035/037) -- an untared force is
+         partly recalibration noise, not contact signal.
+      3. LOW-PASS FILTER at `--force_cutoff_hz` (default 2.0 Hz, matching
+         plot_episode_forces.py's chosen visualization cutoff), via
+         scipy.signal.filtfilt -- offline/non-causal (zero phase lag), fine
+         for a training-label pass (not a real-time loop).
+      4. For each frame_id used by the dataset window sampler, look up that
+         frame's timestamp (torque_log.npz's frame_id -> t mapping, already
+         nearest-matched to the dense log with sub-20ms error) and take the
+         nearest tared+filtered dense sample. This is the frame's 3D force
+         label, used both as a past-observation feature and a
+         future-prediction target.
+
+    Note on which episodes have force data: 36 of PastaTransfer_force's 37
+    episodes have replay force logs (episodes 001-019 never had
+    `--capture_camera` replay run; "021-037" was a training-DATA-SUBSET
+    naming choice made for an earlier, unrelated policy-architecture batch,
+    not a force-log-availability boundary).
+
+4.4 Live force estimation at deployment time
+    ----------------------------------------------------------------------
+    Same three-tier chain, run once per 10Hz control tick (100ms budget).
+    `full_dynamics_regressor` costs ~25ms/call (confirmed via
+    benchmark_force_admittance.py's stage-timing test), i.e. ~40Hz max --
+    fine at 10Hz (uses <40% of one tick), but explicitly too slow for a
+    100Hz admittance loop (a separate, faster streaming architecture,
+    deploy_streaming.py, exists for that case and simply omits this stage).
+    qddot is estimated live via a persistent `VelocityDifferentiator`
+    (smoothed finite difference of qdot over time, `--qddot_smoothing`
+    default 0.3, matching the training-label pipeline's default).
+
+4.5 A real pipeline bug: live force vs. training-label force mismatch
+    ----------------------------------------------------------------------
+    Found 2026-07-13. `07_deploy_force.py`'s live `read_F_raw` was copied
+    from `deploy_streaming.py`'s 100Hz loop, which explicitly OMITTED the
+    mass/Coriolis dynamics-regressor stage (tier 3) for being "too slow" at
+    100Hz. That constraint was never re-checked for this script's 10Hz loop
+    (where the regressor easily fits the tick budget). NET EFFECT: every
+    live force reading, in every deployment run up to this point, was on a
+    DIFFERENT correction chain than what the model was actually trained on
+    -- training labels were fully dynamics-compensated (tier 3), live reads
+    stopped at tier 2.
+
+    Fixed: added `get_qdot_deg`/`GetAngularVelocity` SDK binding, a
+    persistent `VelocityDifferentiator` for live qddot estimation, and the
+    missing dynamics-regressor subtraction, matching
+    `analyze_replay_full.py`'s chain exactly. New `--dynamics_pi` /
+    `--qddot_smoothing` args (defaults match the training-label pipeline).
+    All admittance-control experimental results in Section 7 below were
+    collected AFTER this fix (results collected before it, from earlier the
+    same day, are not directly comparable and are called out as such where
+    they appear in the source notes).
+
+
+5. FORCE-CONDITIONED POLICY ARCHITECTURES AND TRAINING
+--------------------------------------------------------------------------------
+
+Base policy: DDPM diffusion policy (existing `DiffusionPolicyNet`,
+`policy_common.py`), dual-camera image observation, `action_horizon=16`,
+trained on REPLAY images (matching what deployment's live camera sees --
+the robot's own gripper doing the task, no human hand to mask out).
+
+`05_train_replay_force.py` extends the replay-image dataset
+(`05_train_replay.py`) from 9D pose observation/action to 12D
+[pose9, force3], in two variants:
+
+5.1 Combined variant (force is both observed and predicted)
+    ----------------------------------------------------------------------
+    - Observation: past 12D [pose, force] proprioception.
+    - Action target: future 12D [pose, force], predicted JOINTLY over the
+      same action_horizon.
+    - Loss: per-dimension weighted noise-prediction MSE. Pose dims weighted
+      1.0, force dims weighted 0.2 (`--force_loss_weight`, default) --
+      force is a noisier, more contact-geometry-sensitive signal across
+      demonstrations than pose (two demos of "the same" phase can have
+      different contact force even with similar poses), so it stays
+      auxiliary; pose prediction remains the dominant training signal.
+    - `policy_common.py`'s `DiffusionPolicyNet`/`MaxAbsNormalizer` needed
+      ZERO changes (already dimension-generic via `action_dim`/`proprio_dim`
+      constructor params) -- only the dataset/training script changed.
+    - Checkpoint metadata stores `proprio_dim=12`, `action_dim=12`,
+      `predicts_force=True`, `force_in_proprio=True`.
+
+5.2 Conditioning-only variant (force observed, never predicted)
+    ----------------------------------------------------------------------
+    `--no_predict_force` flag: force still feeds the observation (proprio
+    stays 12D), but the action target is pure 9D pose -- the model is never
+    asked to predict future force, only better positions. Isolates "does
+    force-conditioning improve pose prediction" from "can this model also
+    predict force" (the combined variant's force-prediction accuracy was
+    found to generalize poorly to a held-out high-drift episode -- see
+    5.3). Checkpoint metadata: `proprio_dim=12`, `action_dim=9`,
+    `predicts_force=False`, `force_in_proprio=True` (this last field is
+    stored SEPARATELY from `predicts_force` precisely so the deploy script
+    can build the right-shaped proprio observation regardless of variant).
+
+    Deployment-side: this variant runs through the ordinary position
+    controller with no admittance correction available (there is no
+    predicted future force to use as a reference) -- it can only ever
+    inform pose prediction, never modulate the control law directly.
+
+    Training data for both variants: episodes 001-030 only (36 episodes had
+    force logs in total; 031-037 excluded -- see 5.3, they are a high-drift
+    outlier cluster), episode 020 held out for validation. Both trained
+    concurrently; val loss bottomed around epoch 100-110 for both (combined
+    0.0422, cond-only 0.0449), then rose (standard overfitting pattern seen
+    across every policy trained in this project) -- manually stopped at
+    epoch ~290, `policy_epoch0100.pt` used as the best-available checkpoint
+    for both (saved every 100 epochs; epoch 100 sits very close to the true
+    minimum for both).
+
+5.3 Offline force-prediction accuracy and the episode drift investigation
+    ----------------------------------------------------------------------
+    `eval_force_prediction.py` (reuses the training dataset class + real
+    DDPM inference, no robot needed) compares predicted vs. actual recorded
+    force on a held-out episode, against a naive "assume force stays
+    constant" baseline:
+
+        Episode   Model MAE   Baseline MAE   Result
+        -------   ---------   ------------   ------------------------------------
+        037       1.754N      0.955N         Model WORSE by 83.8% (worst on Fx:
+                                              2.946 vs 0.696N). Error flat/bad from
+                                              horizon step 1 onward -- signature of
+                                              systematic mismatch, not "hard to
+                                              predict far ahead."
+        020       0.393N      0.866N         Model BEATS baseline by 54.6%, wins
+                                              every axis and every horizon step.
+                                              (Was in-training-set for the run that
+                                              produced this number -- not a clean
+                                              generalization test on its own.)
+
+    Investigation: checked "drift" (mean force in the last 3s of an
+    episode's recording minus the first 3s) across all 37 episodes with
+    replay force logs:
+
+        Episodes    Drift magnitude
+        ---------   --------------------------------------------
+        001-030     mean 1.78N, median 1.57N, range [0.53, 3.39]
+        031-037     mean 5.12N, median 5.37N, range [3.24, 6.55] -- 2-3x higher
+
+    Cross-referenced recording timestamps: 025-030 recorded 15:15-15:48
+    (2026-07-10), an 11-minute gap, then 031-037 recorded 15:59-16:47, same
+    day/session. The drift jump lines up almost exactly with that gap --
+    consistent with a session-cumulative (most likely thermal, motor/joint
+    heating over a continuous multi-hour session) effect rather than random
+    per-episode noise. Episode 037 (the validation episode in the first
+    training run) sits in this anomalous cluster, plausibly explaining its
+    poor generalization result above more than any fundamental flaw in the
+    modeling approach.
+
+    Live check, same day: deployed the existing position-only (non-force)
+    checkpoint live and measured the CURRENT live force drift over a
+    verified, complete 95.3s run: 1.36N -- squarely in the 001-030 "normal"
+    range, nowhere near the 031-037 cluster. Confirms the anomaly was
+    specific to that one 2026-07-10 recording session, not a persistent
+    property of the robot's current calibration state.
+
+    Response: both training variants (5.1/5.2) were retrained on episodes
+    001-030 only, excluding the high-drift cluster (see 5.2 above).
+
+
+6. ADMITTANCE CONTROL: THEORY AND IMPLEMENTATION
+--------------------------------------------------------------------------------
+
+6.1 Connection to Modern Robotics Ch. 11 (force/impedance control)
+    ----------------------------------------------------------------------
+    Modern Robotics (Lynch & Park) Section 11.5's force-control law commands
+    JOINT TORQUE directly:
+
+        tau = g~(theta) + J^T(theta) [ Fd + Kfp Fe + Kfi INT(Fe dt) - Kdamp V ]        (9)
+
+    requiring reliable torque-control mode. NOT implementable here -- direct
+    torque control on this Jaco2 was already found unreliable earlier in
+    the project (API reports success but control fails; needed a power
+    cycle), so all force work stays in position control.
+
+    Section 11.7 (Impedance/Admittance Control) is the textbook's own
+    prescribed alternative for exactly this situation, defined by the
+    general second-order relationship (Eq. 11.62):
+
+        m x_ddot + b x_dot + k x = f                                                   (10)
+
+    or, in transfer-function form, Y(s) = X(s)/F(s) -- force in, position
+    out. What this project built (below) is the STIFFNESS-ONLY special case
+    of this equation (m=0, b=0), which is literally the structure already
+    arrived at independently before this reading was done.
+
+6.2 The implemented control law
+    ----------------------------------------------------------------------
+    Implemented in `07_deploy_force.py` (`--admittance` flag, off by
+    default; requires a `predicts_force` checkpoint). Per control tick:
+
+        correction = (F_live - f_desired) / K                                          (11)
+        if ||correction|| > cap:  correction *= cap / ||correction||   (vector-magnitude cap, not per-axis)
+        T_base_eef_pred[:3, 3] += correction
+        T_base_eef_clamped = clamp_pose_step(T_base_eef_pred, T_base_eef_cur, max_trans_step, max_rot_step_deg)
+
+    where:
+      F_live       -- live estimated external force (Section 4.4), causal
+                      2Hz Butterworth-filtered, tared at session start
+      f_desired    -- the policy's own predicted future force (from the
+                      combined variant, Section 5.1) -- a time-varying
+                      admittance reference, not a fixed constant
+      K            -- admittance stiffness, N/m (`--K`, default 200.0)
+      cap          -- `--f_max_correction_cm` (default 2.0cm), vector-norm cap
+      clamp_pose_step -- the SAME per-step safety clamp `07_deploy.py`
+                      already used for pure position control (`--max_trans_step`,
+                      `--max_rot_step_deg`)
+
+    Two independent safety layers: (1) the correction itself is
+    vector-magnitude-capped before being added; (2) the combined (predicted
+    position + correction) target then passes through the existing
+    position-clamp safety bound -- the correction cannot bypass the
+    position-side safety mechanism regardless of how large K^-1(F_live -
+    f_desired) computes to. `--force_safety_threshold` (default 15N) zeroes
+    the correction entirely (not the whole command) if live |F| exceeds it,
+    on the theory that a bad correction shouldn't be trusted at extreme
+    readings. Works with ordinary 9D (position-only) checkpoints too
+    (correction forced to zero), so the SAME deploy script A/Bs
+    position-only vs. hybrid control with every other setting identical --
+    this is what makes the Section 7 comparisons a clean, controlled
+    experiment.
+
+6.3 A saturation bug found and fixed
+    ----------------------------------------------------------------------
+    First `--execute --admittance` run: robot scooped successfully, then
+    hovered over the pasta box indefinitely instead of proceeding to the
+    bowl, despite the policy-view overlay showing the model predicting
+    motion toward the bowl. Logged `corr=` was pinned at the cap (2.00cm)
+    on >95% of all steps from step 9 through the end of a 150-step run --
+    continuous saturation, not an occasional nudge.
+
+    ROOT CAUSE: `--max_trans_step` (the per-step position-clamp safety
+    bound) and `--f_max_correction_cm` (the admittance correction cap) both
+    defaulted to the same 2cm. Since the correction is added to the target
+    BEFORE `clamp_pose_step` runs, a saturated correction alone could
+    consume the ENTIRE per-step motion budget, leaving no room for the
+    model's actual predicted progress to survive the clamp --
+    `clamp_pose_step` scales the combined (progress + correction) vector
+    down to fit in 2cm regardless of how much of that vector was "useful"
+    motion. Position visibly froze in a narrow band (Z stuck at 6-8cm, no
+    further descent-then-lift) for the entire second half of the run.
+
+    FIX (tested, confirmed): raised `--max_trans_step` to 0.04 (double the
+    correction cap), keeping the correction-before-clamp ordering (so total
+    per-step motion is still hard-bounded, just by a larger number -- safety
+    semantics unchanged in kind). Re-ran the identical scenario -- position
+    trajectory now visibly transitions through multiple regions instead of
+    freezing (a real ~12cm/~5cm/~8cm shift in X/Y/Z around steps 105-134 of
+    the 150-step run, then stabilizing near the bowl) -- TASK COMPLETED
+    SUCCESSFULLY: scoop, transfer, and drop into the bowl, live on the
+    robot, using the predicted-force admittance reference.
+
+6.4 Known gap: stiffness-only, missing damping/inertia terms
+    ----------------------------------------------------------------------
+    The implemented law (Eq. 11) is the STIFFNESS-ONLY term of the full
+    second-order impedance relationship (Eq. 10) -- no inertia (m) or
+    damping (b) term anywhere. It is a memoryless, purely proportional map
+    from force error to position displacement, recomputed independently
+    every tick.
+
+    This is a PLAUSIBLE (not confirmed) explanation for the "stuck at low
+    Z, oscillating, correction pinned at the cap" failure signature found
+    in the 50%-pasta hybrid trials (Section 7.3) -- a proportional-only
+    (undamped) feedback loop hunting around a reference it can't quite
+    satisfy, rather than settling, is a textbook symptom of missing
+    damping. Directly connects back to Section 11.5's own refined law
+    (Eq. 9), which adds a -Kdamp*V term for exactly this reason ("if there
+    is nothing to push against, it will accelerate in a failing attempt").
+
+    NEXT STEP, EXPLICITLY NOT YET IMPLEMENTED (deferred by project owner
+    decision, documented here for future work):
+
+        correction = (F_live - f_desired)/K - Kdamp * V_actual                         (12)
+
+    using Cartesian velocity already derivable from consecutive position
+    reads. Inertia is a separate, more involved addition (would need the
+    correction to have actual second-order dynamics of its own, not just
+    filtering the F_live measurement) -- lower priority, worth revisiting
+    only if damping alone doesn't resolve the oscillation pattern.
+
+
+7. EXPERIMENTAL RESULTS: POSITION CONTROL VS. ADMITTANCE CONTROL
+--------------------------------------------------------------------------------
+
+All results below use the combined-variant checkpoint
+(`data/checkpoints/PastaTransfer_force_replay_force_ep1-30/policy_epoch0100.pt`,
+Section 5.1, trained on episodes 001-030), initialized from episode 021's
+frame-0 pose, deployed via `07_deploy_force.py` AFTER the Section 4.5 live
+force-pipeline fix. "Position-only" = same checkpoint, `--admittance` off
+(correction forced to zero throughout, matching a pure position-control
+baseline exactly). "Hybrid" = same checkpoint, `--admittance` on. Every
+other setting (checkpoint, init pose, max_trans_step=0.04, K=200,
+f_max_correction_cm=2.0) held identical between conditions unless noted.
+"Reference" = the human-demonstrated episode 021 itself.
+
+7.1 Primary result -- full-pasta, 7-trial controlled comparison
+    ----------------------------------------------------------------------
+    exec_steps=8 (default), full pasta fill (matching training conditions):
+
+        Condition                  |F| mean          |F| max                   path length
+        -------------------------  ---------------   -----------------------  ------------------------
+        Position-only (n=3)        2.17 +/- 0.16N     5.09 +/- 0.58N            109.5 +/- 5.0cm
+                                                       (range 4.46-5.87)         (range 104-116)
+        Hybrid (n=4)                2.57 +/- 0.16N     15.68 +/- 6.34N          138.3 +/- 5.6cm
+                                                       (range 9.66-26.21)        (range 133-148)
+        Reference (ep. 021 demo)    5.70N              10.25N                   --
+
+    With 7 total trials, the peak-force and path-length ranges DO NOT
+    OVERLAP AT ALL between conditions -- position-only never exceeds 5.9N
+    across 3 runs, hybrid never drops below 9.7N across 4. Same for path
+    length (104-116cm vs. 133-148cm). This is the cleanest, most solid
+    finding of the whole investigation: holding the checkpoint and every
+    other setting identical, admittance control reliably produces higher
+    peak contact force (closer to the 10.25N human-demonstrated reference)
+    and a longer effective task path than position-only control.
+
+    Reproducibility check: across the 4 hybrid trials, |F|mean (+/-0.16N,
+    ~6%) and path length (+/-5.6cm, ~4%) are tight -- a stable, repeatable
+    controller, not a one-off fluke (the first trial's 26N peak was
+    actually the outlier of the four; the other three peaked at 9.7-14.8N,
+    much closer to the reference's own 10.25N). Investigated directly from
+    logs (position reconstructed via forward kinematics from q_deg): the
+    26N peak traces to a genuine scoop-entry contact event (steps 18-24,
+    Z drops 19cm -> 12.6cm, strongly negative Fz throughout, rising and
+    falling smoothly over ~2.4s) -- the textbook "real push" signature
+    (smooth rise-peak-fall over hundreds of ms to seconds), not an isolated
+    noisy sample. Only 3.5% of that run's steps exceed the reference
+    episode's own peak, 5% exceed its mean -- the elevated force is
+    localized to the genuine scoop-contact event, not a run-wide effect.
+
+    Interpretation: mean force only rises modestly (~18%) between
+    conditions, but peak force and path length (~33% longer) both point the
+    same direction -- position-only control looks like it is
+    systematically under-committing to contact (moving through the scoop
+    without pushing hard enough to match the demonstrated force profile),
+    while the admittance correction consistently drives real contact forces
+    into the same range as the human reference. This is the first clean
+    evidence that the force correction does more than "complete the task
+    while feeling different" -- it is measurably closer to the demonstrated
+    contact behavior than position-only control, using the same checkpoint
+    and non-force settings otherwise.
+
+7.2 Effect of execution horizon (exec_steps 8 vs. 16)
+    ----------------------------------------------------------------------
+    `--exec_steps` controls how much of the predicted 16-step (1.6s) action
+    horizon is executed before replanning (default 8, receding-horizon
+    style). Re-ran matched pairs at exec_steps=16 (full predicted horizon
+    executed per inference cycle) to see whether the effect above depends
+    on this setting:
+
+        exec_steps   Position-only |F|max         Hybrid |F|max               Path (hybrid vs. pos-only)
+        ----------   --------------------------   --------------------------  ---------------------------
+        8 (n=3/4)    5.09 +/- 0.58N (4.46-5.87)    15.68 +/- 6.34N (9.66-26.21) 138.3 vs. 109.5cm
+        16 (n=3/3)   6.90 +/- 0.37N                11.15 +/- 4.24N (7.5-17.1)   136.6 vs. 101.8cm
+
+    The effect SURVIVES at exec_steps=16 -- hybrid still higher on every
+    trial -- but the gap SHRINKS substantially (~3x separation at
+    exec_steps=8 down to ~1.6x at exec_steps=16), and hybrid's peak force
+    becomes noticeably noisier (std 4.24 vs 0.37 for position-only).
+    Plausible mechanism: exec_steps=16 replans half as often, so there are
+    fewer "fresh chunk" transition moments -- and if large corrections
+    concentrate specifically at those transitions (consistent with earlier
+    deploy_streaming.py findings elsewhere in this project), fewer
+    transitions per unit time means fewer/smaller spikes.
+
+    Re-ran exec_steps=8 once more later the same session to double-check:
+    position-only |F|max=7.16N, hybrid |F|max=11.54N -- hybrid still ahead
+    (~1.6x), but position-only's own peak here is HIGHER than any of its
+    original 3 exec_steps=8 trials (4.46-5.87N), narrowing the gap
+    similarly to the exec_steps=16 result even though this run used the
+    exec_steps=8 default. This suggests at least part of the narrowing
+    across later trials may be a SESSION-DRIFT effect (Section 7.5) rather
+    than purely an exec_steps effect -- not confirmed, just the most likely
+    explanation given the rest of the session's findings.
+
+7.3 Varying pasta fill level -- sparse / 50% / full
+    ----------------------------------------------------------------------
+    Motivated by the peak-force finding in 7.1: if position-only reliably
+    under-commits to contact, it might be more likely to glide over sparse
+    remaining pasta rather than press down enough to gather it.
+
+    IMPORTANT CAVEAT (established mid-investigation, applies to this whole
+    subsection): episodes 001-030 -- the ENTIRE training set for this
+    checkpoint -- were recorded with a CONSTANT pasta fill level. There is
+    no fill-level variation anywhere in the training data for the model to
+    have learned a force-vs-fill-level relationship from. f_desired is
+    therefore a fixed reference tied to whatever force followed each point
+    in the trajectory during training, with no mechanism to adapt to how
+    much material is actually in the box on a given run. Under this lens,
+    the results below are evidence of what UNCONTROLLED OUT-OF-DISTRIBUTION
+    EXTRAPOLATION looks like, not evidence that the force-conditioning
+    mechanism is unreliable in general (or that it generalizes better/worse
+    than position-only to physical variation -- that hypothesis was never
+    properly tested here, since testing it properly would require training
+    data that itself spans multiple fill levels).
+
+    Sparse-pasta results (confirmed genuine contact via live force
+    readings, up to ~3.8N, not just noise):
+
+        Condition          Trials     Outcome
+        ----------------   --------   ---------------------------------------
+        Position-only      1          Failed to scoop
+        Hybrid              2          Both succeeded (scooped and transferred)
+
+    (Caveat: N=1 vs N=2, box was topped up slightly between the
+    position-only failure and the hybrid attempts -- not a clean, perfectly
+    controlled comparison the way the 7-trial full-pasta result was.)
+
+    Also captured, for the first hybrid sparse-pasta trial, a direct
+    force-vs-position decomposition (Section 7.6): the force correction
+    contributed ~39% of the combined per-step signal on average, was the
+    dominant contributor on 22% of ticks, and only hit the hard 2cm cap
+    8.3% of the time -- much less saturated than the normal-pasta hybrid
+    trials, suggesting the predicted force reference tracked live force
+    more closely in this sparser condition.
+
+    50%-pasta results (result FLIPS from the sparse-pasta test):
+
+        Condition          Trials     Outcome
+        ----------------   --------   ---------------------------------------
+        Position-only      2          Both succeeded (2/2)
+        Hybrid              2          Both failed (2/2)
+
+    Both failed hybrid trials show the SAME signature: the arm descends
+    into the box normally (Z: ~23cm -> 6-8cm), then GETS STUCK OSCILLATING
+    at that low Z for the rest of the run (never climbs back out), with the
+    correction magnitude frequently pinned at the 2cm cap during the stuck
+    phase. Compare to the successful sparse-pasta hybrid trial, which shows
+    a clean transition -- down to ~6cm, then decisively back up to ~20cm
+    and staying there (the lift-and-carry phase). The saturated correction
+    during the stuck phase suggests the admittance term is actively
+    fighting the transition out of contact, not just failing to help (see
+    Section 6.4's damping-term discussion for a plausible mechanism).
+
+    Root-cause interpretation (confirmed directly with the project owner):
+    the inconsistent pattern across pasta levels (sparse: hybrid wins 2/2
+    vs position-only 0/1; 50%: position-only wins 2/2 vs hybrid 0/2) is
+    exactly the expected shape of uncontrolled out-of-distribution
+    extrapolation from a constant-fill-level training set, not evidence the
+    mechanism is unreliable in general. Sometimes the fixed reference
+    happens to approximately match the actual contact dynamics (helps, or
+    is neutral); sometimes it doesn't (the correction fights the natural
+    trajectory instead of assisting it).
+
+7.4 Confirmatory 50%-pasta retest (force-generation, not task success)
+    ----------------------------------------------------------------------
+    One more matched pair at the fixed 50% level, specifically to check
+    whether the FORCE-GENERATION difference (not task success) still holds
+    outside the training distribution:
+
+        Condition (50% pasta)      |F| mean      |F| max      path length
+        -------------------------  ------------  -----------  ------------
+        Position-only               2.38N          7.91N        121.3cm
+        Hybrid                      2.60N          7.33N        171.9cm
+
+    The peak-force gap that was completely reliable at full pasta (hybrid
+    9.7-26.2N vs. position-only 4.5-5.9N, zero overlap across 7 trials) IS
+    GONE here -- position-only's peak is actually marginally higher than
+    hybrid's this time, and mean force is nearly identical. Only the
+    path-length effect survives (hybrid still ~42% longer, consistent with
+    the full-pasta finding).
+
+    BOTTOM LINE FOR THIS WHOLE LINE OF INVESTIGATION: force-conditioning-
+    driven admittance control is real, learnable from human demonstrations,
+    and produces a measurable, reliable effect (peak force, path length)
+    when deployed under MATCHING conditions (same fill level as training)
+    -- but nothing tested in this project shows it generalizing BETTER than
+    position-only to conditions the training data didn't include. Testing
+    that properly would require training data that itself varies the thing
+    being generalized over (pasta fill level, in this case).
+
+7.5 Session-drift as a confound
+    ----------------------------------------------------------------------
+    The same phenomenon documented for episodes 031-037 (Section 5.3) --
+    cumulative thermal/calibration drift over a multi-hour continuous
+    session -- is the leading (not confirmed) explanation for why the
+    hybrid-vs-position-only gap narrowed across the LATER trials on this
+    same day (both the exec_steps=16 result and the late exec_steps=8
+    re-confirmation, Section 7.2), independent of exec_steps itself.
+    Several dozen trials were run over a few hours; this narrowing has the
+    same signature (position-only's own peak trending upward over the
+    session) as the earlier drift finding.
+
+7.6 Force-vs-position contribution decomposition
+    ----------------------------------------------------------------------
+    New per-tick logging added to `07_deploy_force.py`
+    (`pos_cur_before`/`pos_pred_raw`/`correction`/`pos_clamped`) to quantify,
+    per control tick, how much of the commanded step came from the position
+    policy's own intent vs. the force correction.
+
+    One measured result (first hybrid sparse-pasta trial, Section 7.3):
+      - Force correction contributed ~39% of the combined per-step signal
+        on average (median 41%).
+      - Force was the DOMINANT contributor (larger than the position
+        policy's own intended step) on 22% of ticks.
+      - The hard 2cm correction cap was hit on 8.3% of ticks in this run --
+        much less saturated than the normal-pasta hybrid trials.
+    CAVEAT: this specific run was later confirmed to be under
+    genuine-but-sparse contact conditions, not representative of full-pasta
+    behavior; treat this single number as illustrative of what the
+    decomposition CAN show, not a general statement about force's average
+    contribution across all conditions.
+
+
+8. SUMMARY OF OPEN ITEMS / FUTURE WORK
+--------------------------------------------------------------------------------
+
+  1. Add a velocity-damping term to the admittance correction (Eq. 12,
+     Section 6.4) -- explicitly identified as a plausible fix for the
+     stuck-at-low-Z oscillation failure mode, NOT YET IMPLEMENTED (deferred
+     by project-owner decision, to be revisited).
+  2. Separate the execution-horizon effect from the possible session-drift
+     effect (Section 7.2/7.5) -- more trials needed, ideally with tighter
+     time control or recalibration between sessions.
+  3. Test the conditioning-only variant (Section 5.2) against a true
+     9D-no-force baseline -- never done. This is the one comparison that
+     would isolate whether force-as-input ALONE (no admittance at all)
+     already improves position predictions, the original motivation for
+     building that variant.
+  4. Collect or construct training data with genuine pasta fill-level
+     variation, to properly test whether force-conditioning generalizes to
+     physical variation the training data doesn't otherwise cover (the
+     original motivating hypothesis behind the whole varying-pasta-level
+     investigation, still not properly tested -- see Section 7.3/7.4).
+  5. `--f_max_correction_cm` (still 2cm) has not itself been re-tuned --
+     only `--max_trans_step` was raised to give it headroom (Section 6.3).
+     Worth testing whether a smaller correction cap (e.g. 0.5-1cm) plus the
+     original 2cm max_trans_step gives similar or better results without
+     needing a larger position-clamp bound.
+  6. The causal (`OnlineButterworth`, real-time, phase-lagged) live filter
+     vs. the non-causal (`filtfilt`, zero-phase) filter used for training
+     labels was ruled out as the PRIMARY cause of the "more aggressive"
+     force-magnitude observation (the clamp-budget saturation bug fully
+     explained it), but was not independently verified to contribute
+     nothing at all.
+  7. Only tested against episode 021's pre-positioned starting pose so far
+     -- worth trying other episodes/frames to see how well the force
+     reference generalizes across starting conditions.
+  8. The mass/Coriolis pipeline fix (Section 4.5) changes what "expected/
+     reference force" means for any comparison that used the old
+     (gravity-only) live pipeline -- those older numbers are not directly
+     comparable to anything measured after the fix; all numbers reported in
+     Section 7 above were collected after the fix.
+
+
+9. KEY FILE AND SCRIPT INDEX
+--------------------------------------------------------------------------------
+
+GRAVITY:
+  calibrate_firmware_gravity.py    -- firmware routine wrapper + safety gating
+  calibrate_gravity_residual.py    -- linear regressor, random-pose collection
+  collect_task_poses.py /
+  evaluate_task_poses.py           -- task-pose collection + held-out eval
+  fit_gravity_residual_nn.py       -- gravity residual NN (best gravity result)
+  upload_gravity_params.py         -- reapply saved firmware params (session-only)
+  extend_gravity_from_excitation.py -- superseded linear re-fit; kept for its
+                                        extract_static_stretches() helper
+  data/gravity_params.npy          -- firmware fit (2nd, clean attempt)
+  data/gravity_phi_task_only.npy   -- trusted linear gravity regressor
+  data/gravity_residual_nn.pt      -- trusted gravity residual NN
+
+DYNAMICS (MASS/CORIOLIS):
+  contact_detector.py              -- rnea_full, full_dynamics_regressor,
+                                       gravity_regressor, torque_to_wrench,
+                                       recover_external_force
+  dynamics_dataset.py              -- shared target-building pipeline
+  fit_dynamics_regressor.py        -- 72-param linear ridge fit (recommended)
+  fit_dynamics_nn_constrained.py   -- physically-constrained NN (M_res/C_res
+                                       heads; reference, statistically tied)
+  fit_dynamics_nn.py               -- DEPRECATED, unconstrained NN, DO NOT USE
+                                       (leaks gravity error into output)
+  compare_dynamics_residual_v3.py  -- final head-to-head comparison script
+  data/dynamics_residual_pi.npy    -- trusted linear dynamics regressor
+  data/dynamics_residual_nn_constrained_v3.pt -- final constrained NN (reference)
+
+LIVE / POST-HOC FORCE INSPECTION:
+  diag_replay_forces.py            -- live 3-tier force plot during a replay
+  diag_live_forces.py              -- live 3-tier plot while hand-guiding (read-only)
+  analyze_replay_full.py           -- post-hoc 3-tier force analysis + plot
+                                       (produces every training label used)
+  analyze_replay_forces.py /
+  analyze_replay_dynamics.py       -- older, partial (2-tier) analysis variants
+  replay_episode.py                -- episode replay with dense (q,qdot,torque)
+                                       logging + --capture_camera image capture
+
+FORCE-CONDITIONED TRAINING / DEPLOYMENT:
+  05_train_replay.py               -- position-only replay-image training (base)
+  05_train_replay_force.py         -- force-conditioned training, both variants
+                                       (--no_predict_force for conditioning-only)
+  eval_force_prediction.py         -- offline force-prediction accuracy eval
+  07_deploy.py                     -- position-only deployment (untouched, "sacred")
+  07_deploy_force.py               -- force-conditioned + admittance deployment
+  deploy_streaming.py              -- separate 100Hz streaming-velocity deploy
+                                       path (different control architecture)
+  benchmark_force_admittance.py    -- read-only hardware-capability benchmark
+                                       for the admittance design (stage timing,
+                                       noise floor, correction magnitude)
+  policy_common.py                 -- shared DiffusionPolicyNet/MaxAbsNormalizer
+  test_policy.py                   -- shared inference (predict_action_sequence*)
+
+DATA / LOGS:
+  deploymentRuns/2026-07-13_force_conditioning_eval/ -- all 36 force_log_*.npz
+    files from the position-only-vs-hybrid experiments in Section 7, indexed
+    by a README.md (checkpoint / mode / pasta-level / outcome per file)
+
+SUPERSEDED / REFERENCE ONLY:
+  data/gravity_phi.npy                       -- earlier mixed random+task fit
+  data/gravity_phi_task_only_v2.npy           -- superseded linear re-fit
+  data/dynamics_residual_nn.pt                -- original unconstrained NN
+                                                  ("what not to do" reference)
+  data/gravity_params_meta.npz                -- first (bad) firmware fit metadata
+
+================================================================================
+END OF REPORT
+================================================================================
+
+--------------------------------------------------------------------------------
+10. TO-DO (added 2026-08-24, not yet implemented)
+--------------------------------------------------------------------------------
+
+  1. Train a checkpoint that predicts the full 6D wrench (not just 3D force).
+     The recovery pipeline already computes and saves moments -- analyze_
+     replay_full.py's wrench_final is (n,6) and replay_full_forces.npz
+     already has external_moment_xyz alongside external_force_xyz for every
+     one of the 36 replay episodes. Only 05_train_replay_force.py's loader
+     discards it (FORCE_DIM=3, only external_force_xyz is read). Needed:
+       - Extend 05_train_replay_force.py additively (new flag, existing
+         12D/9D behavior untouched) to optionally load external_moment_xyz
+         and extend proprio/action to 15D [pose9, force3, moment3].
+       - New training run (can't reuse existing 12D checkpoints -- different
+         action_dim/proprio_dim).
+       - 07_deploy_force_6d.py currently uses a FIXED m_desired=0 (no
+         checkpoint predicts moments yet) -- once this checkpoint exists,
+         read the real predicted m_desired out of the action the same way
+         f_desired already works, instead of the fixed-zero placeholder.
+
+  2. Extend the admittance law from stiffness-only to the full second-order
+     form (M*x_ddot + D*x_dot + K*x = F_e, Modern Robotics Eq. 11.62), in a
+     NEW script (do not modify 07_deploy_force.py or 07_deploy_force_6d.py).
+     Current law is memoryless (x = F_e/K, recomputed independently every
+     tick, no state). Full law requires:
+       - Persistent per-axis state (x, x_dot) carried across control ticks.
+       - A stable discretization at the 10Hz control rate -- prefer the
+         exact zero-order-hold (matrix-exponential) discretization of the
+         linear state-space system over naive Euler, to avoid integrator
+         instability regardless of the M/D/K choice.
+       - D (damping) is the priority term -- directly targeted at the
+         "stuck at low-Z, oscillating, correction pinned at cap" failure
+         mode found in the 50%-pasta hybrid trials (Section 7.3); this is
+         also the term Modern Robotics' own refined law adds (-Kdamp*V).
+       - M (virtual mass) is a separate, lower-priority addition -- smooths
+         the correction's response to sudden force spikes, but an
+         underdamped M can worsen oscillation rather than fix it; if added,
+         tune D relative to M for critical/overdamped response per axis
+         (D >= 2*sqrt(M*K)).
+       - Decide scope: translation only (mirrors current --admittance), or
+         both translation and the new rotational term from 07_deploy_
+         force_6d.py.

@@ -406,6 +406,17 @@ def main():
             if isinstance(loaded, trimesh.Scene) else loaded)
     if mesh.bounding_box.extents.max() > 0.5:
         mesh.apply_scale(0.01)
+    # FoundationPose's make_mesh_tensors requires either a real texture image
+    # or vertex colors -- a mesh whose .mtl has a plain Kd color but no
+    # map_Kd (texture) leaves mesh.visual as TextureVisuals with image=None,
+    # which crashes there. Convert to vertex colors from the material's
+    # diffuse color in that case (no-op for meshes that already have a real
+    # texture or no material at all, e.g. spoon.obj/newspoon1.obj).
+    if (isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals)
+            and mesh.visual.material.image is None):
+        diffuse = np.array(mesh.visual.material.diffuse[:3], dtype=np.uint8)
+        vertex_colors = np.tile(diffuse.reshape(1, 3), (len(mesh.vertices), 1))
+        mesh.visual = trimesh.visual.color.ColorVisuals(mesh=mesh, vertex_colors=vertex_colors)
     to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
     inv_to_origin = np.linalg.inv(to_origin.astype(np.float64))
 
